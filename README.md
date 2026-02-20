@@ -1,8 +1,6 @@
-# Home+ Gesture Dataset Pipeline (RGB-D, MediaPipe)
+# Home+ Gesture Pipeline
 
 This repository contains scripts to (1) collect RGB-D gesture clips, (2) featurize clips into fixed-length sequences, (3) train a gesture classifier, and (4) run live recognition with an Intel RealSense camera.
-
-The dataset itself is not stored in the git repository. Use GitHub Releases (or another storage host) for the dataset zip.
 
 ## Repository layout
 
