@@ -28,6 +28,7 @@ dataset.zip
 output/
 processed*/
 *_done/
+dataset/
 
 # Training artifacts
 runs/
