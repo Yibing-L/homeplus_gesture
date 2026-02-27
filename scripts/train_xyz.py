@@ -637,6 +637,8 @@ def main():
     all_test_items_with_preds = []
     fold_results = []
     best_global_f1 = -1.0
+    best_global_val_f1 = -1.0
+    best_global_fold = None
     best_global_state = None
     best_global_mu = None
     best_global_sd = None
@@ -744,6 +746,8 @@ def main():
 
         if test_f1 > best_global_f1:
             best_global_f1 = test_f1
+            best_global_val_f1 = float(best_val_f1)
+            best_global_fold = fold_name
             best_global_state = best_state
             best_global_mu = mu
             best_global_sd = sd
@@ -826,6 +830,15 @@ def main():
         "mu": best_global_mu.squeeze().astype(np.float32),
         "sd": best_global_sd.squeeze().astype(np.float32),
         "state_dict": best_global_state,
+        # provenance / eval metadata
+        "roots": [str(r) for r in args.roots],
+        "eval_mode": args.eval_mode,
+        "best_fold": best_global_fold,
+        "best_val_f1": best_global_val_f1,
+        "best_test_f1": float(best_global_f1),
+        "aggregate_f1": float(agg_f1),
+        "aggregate_acc": float(agg_acc),
+        "model_path": str(out_dir / model_key),
     }
     torch.save(artifact, out_dir / model_key)
     log.info(f"Saved {model_key} to {out_dir / model_key}")
@@ -863,6 +876,16 @@ def main():
             "mu": best_global_mu.squeeze().astype(np.float32),
             "sd": best_global_sd.squeeze().astype(np.float32),
             "state_dict": model_7.state_dict(),
+            # provenance / eval metadata
+            "roots": [str(r) for r in args.roots],
+            "eval_mode": args.eval_mode,
+            "best_fold": best_global_fold,
+            "best_val_f1": best_global_val_f1,
+            "best_test_f1": float(best_global_f1),
+            "aggregate_f1": float(agg_f1),
+            "aggregate_acc": float(agg_acc),
+            "model_path": str(out_dir / "model_7.pt"),
+            "derived_from": str(out_dir / model_key),
         }
         torch.save(art7, out_dir / "model_7.pt")
         log.info("Saved model_7.pt (derived from 42-class head)")

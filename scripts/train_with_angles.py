@@ -607,6 +607,8 @@ def main():
     all_y_test, all_p_test, all_preds_with_pid = [], [], []
     fold_results = []
     best_global_f1, best_global_state, best_global_mu, best_global_sd = -1.0, None, None, None
+    best_global_val_f1 = -1.0
+    best_global_fold = None
 
     for fold_i, (train_items, val_items, test_items, fold_name) in enumerate(splits):
         log.info(f"\n{'='*60}")
@@ -685,6 +687,8 @@ def main():
                               f"Confusion: {fold_name}", out_dir / f"cm_{fold_name}.png")
         if tf1 > best_global_f1:
             best_global_f1 = tf1
+            best_global_val_f1 = float(best_val_f1)
+            best_global_fold = fold_name
             best_global_state, best_global_mu, best_global_sd = best_state, mu, sd
 
     # Aggregate
@@ -726,15 +730,25 @@ def main():
     if best_global_state is None:
         log.error("No model to save."); return
 
+    model_key = f"model_{n_classes}.pt"
     artifact = dict(type="attention_bilstm_xyz_angles", in_dim=int(in_dim),
                     n_continuous=N_CONTINUOUS, n_classes=n_classes,
                     hidden=args.hidden, lstm_layers=args.lstm_layers,
                     attn_heads=args.attn_heads, proj_dim=args.proj_dim, dropout=args.dropout,
                     mu=best_global_mu.squeeze().astype(np.float32),
                     sd=best_global_sd.squeeze().astype(np.float32),
-                    state_dict=best_global_state)
-    torch.save(artifact, out_dir / f"model_{n_classes}.pt")
-    log.info(f"Saved model_{n_classes}.pt")
+                    state_dict=best_global_state,
+                    # provenance / eval metadata
+                    roots=[str(r) for r in args.roots],
+                    eval_mode=args.eval_mode,
+                    best_fold=best_global_fold,
+                    best_val_f1=best_global_val_f1,
+                    best_test_f1=float(best_global_f1),
+                    aggregate_f1=float(agg_f1),
+                    aggregate_acc=float(agg_acc),
+                    model_path=str(out_dir / model_key))
+    torch.save(artifact, out_dir / model_key)
+    log.info(f"Saved {model_key}")
 
     if n_classes == 42:
         _, _, W7, b7 = derive_head_7_from_42(best_global_state)
@@ -748,8 +762,10 @@ def main():
         sd7[[k for k in sd7 if "head" in k and k.endswith("weight")][0]] = W7
         sd7[[k for k in sd7 if "head" in k and k.endswith("bias")][0]] = b7
         m7.load_state_dict(sd7)
-        torch.save(dict(**{k: artifact[k] for k in artifact if k not in ("n_classes", "state_dict")},
-                        n_classes=7, state_dict=m7.state_dict()),
+        torch.save(dict(**{k: artifact[k] for k in artifact if k not in ("n_classes", "state_dict", "model_path")},
+                        n_classes=7, state_dict=m7.state_dict(),
+                        model_path=str(out_dir / "model_7.pt"),
+                        derived_from=str(out_dir / model_key)),
                    out_dir / "model_7.pt")
         log.info("Saved model_7.pt")
 
