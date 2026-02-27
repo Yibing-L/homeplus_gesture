@@ -86,7 +86,7 @@ def compute_joint_angles(X):
     # Extract pose and validity from existing X channels (pre-standardization)
     hand_xyz = X[:, 0:63].reshape(T, 21, 3)    # (T, 21, 3)
     arm_xyz  = X[:, 63:72].reshape(T, 3, 3)    # (T, 3, 3)
-    hand_jv  = X[:, 165:186].astype(bool)       # (T, 21) joint validity
+    hand_jv  = X[:, 149:170].astype(bool)       # (T, 21) joint validity
     arm_jv   = X[:, 170:173].astype(bool)       # (T, 3)  arm joint validity
 
     angles      = np.zeros((T, 16), dtype=np.float32)
