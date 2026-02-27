@@ -286,7 +286,7 @@ def main():
         print("No training clips found."); return
 
     # Stats
-    print(f"Global: N={len(items)}, min_valid~{min(it[‘valid’].mean() for it in items):.2f}")
+    print(f"Global: N={len(items)}, min_valid~{min(it['valid'].mean() for it in items):.2f}")
 
     # Generate splits
     if args.eval_mode == "loso":
@@ -300,10 +300,10 @@ def main():
     best_reports = None
 
     for fold, (train_items, val_items, test_items, fold_name) in enumerate(splits, 1):
-        print(f"\n{‘=’*60}")
+        print(f"\n{'='*60}")
         print(f"Fold {fold}/{len(splits)}: {fold_name}  "
               f"(train={len(train_items)} val={len(val_items)} test={len(test_items)})")
-        print(f"{‘=’*60}")
+        print(f"{'='*60}")
 
         # Fit standardization on train
         Xtr = np.stack([it["X"] for it in train_items], 0)  # [N,T,F]
