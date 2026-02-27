@@ -550,7 +550,7 @@ def generate_loso_splits(items):
     Participant-disjoint validation: for each test participant, the next
     participant (cyclic) is held out as validation.
     """
-    pids = sorted(set(it["pid"] for it in items))
+    pids = sorted(set(it["pid"] for it in items), key=lambda x: int(x))
     for i, test_pid in enumerate(pids):
         val_pid = pids[(i + 1) % len(pids)]
         test_items = [it for it in items if it["pid"] == test_pid]
