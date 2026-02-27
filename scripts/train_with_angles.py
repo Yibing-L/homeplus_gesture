@@ -210,7 +210,24 @@ def extract_participant_id(path):
     return parent
 
 
+def _expand_roots(roots):
+    """Expand any glob patterns in roots (needed on Windows where the shell
+    does not expand wildcards before passing args to Python)."""
+    expanded = []
+    for r in roots:
+        if any(c in r for c in ("*", "?", "[")):
+            matches = sorted(glob.glob(r))
+            if matches:
+                expanded.extend(matches)
+            else:
+                expanded.append(r)   # keep as-is so the missing-dir warning fires
+        else:
+            expanded.append(r)
+    return expanded
+
+
 def load_items(roots):
+    roots = _expand_roots(roots)
     items = []
     for r in roots:
         print(f"[LOAD] {r}")
