@@ -20,10 +20,12 @@ def parse_args():
     ap.add_argument("--model", type=str, default="tcn", choices=["tcn", "gru", "lstm", "transformer"])
     ap.add_argument("--save_path", type=str, default="bestcheckpoint",
                     help="Will create a folder containing model_42.pt, model_7.pt and eval files")
+    ap.add_argument("--eval_mode", type=str, default="loso", choices=["loso", "kfold"],
+                    help="LOSO (leave-one-subject-out) or stratified K-fold")
     ap.add_argument("--epochs", type=int, default=80)
     ap.add_argument("--batch_size", type=int, default=64)
     ap.add_argument("--lr", type=float, default=1e-3)
-    ap.add_argument("--k", type=int, default=5, help="K-fold CV")
+    ap.add_argument("--k", type=int, default=5, help="K-fold CV (ignored in LOSO)")
     ap.add_argument("--seed", type=int, default=1337)
     ap.add_argument("--patience", type=int, default=8, help="Early stop after N epochs without val F1 improvement")
     ap.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
@@ -36,6 +38,16 @@ def set_seed(s):
 # ----------------------------
 # Data loading
 # ----------------------------
+def extract_participant_id(path):
+    """Extract participant ID from path like dataset/5/gesture_5_12.npz."""
+    parent = os.path.basename(os.path.dirname(path))
+    if parent.isdigit():
+        return parent
+    m = re.match(r"gesture_(\d+)_", os.path.basename(path))
+    if m:
+        return m.group(1)
+    return parent
+
 def load_items(roots):
     items = []
     for r in roots:
@@ -65,8 +77,9 @@ def load_items(roots):
             if vr < 0.25:
                 print(f"[DROP] {os.path.basename(path)} valid_ratio={vr:.2f}")
                 continue
-            items.append(dict(path=path, X=X, valid=valid, y42=y42))
-    print(f"Loaded {len(items)} clips.")
+            pid = extract_participant_id(path)
+            items.append(dict(path=path, X=X, valid=valid, y42=y42, pid=pid))
+    print(f"Loaded {len(items)} clips from {len(set(it['pid'] for it in items))} participants.")
     return items
 
 class ClipSet(Dataset):
@@ -230,7 +243,38 @@ def derive_head_7_from_42(model_42_state_dict):
     return head_w_name, head_b_name, W7, b7
 
 # ----------------------------
-# Main (K-fold, best fold selection, saving both models & evals)
+# LOSO / K-fold split generation
+# ----------------------------
+def generate_loso_splits(items):
+    """Yield (train_items, val_items, test_items, fold_name) per participant.
+
+    Participant-disjoint validation: for each test participant, the next
+    participant (cyclic) is held out as validation.
+    """
+    pids = sorted(set(it["pid"] for it in items))
+    for i, test_pid in enumerate(pids):
+        val_pid = pids[(i + 1) % len(pids)]
+        test_items = [it for it in items if it["pid"] == test_pid]
+        val_items = [it for it in items if it["pid"] == val_pid]
+        train_items = [it for it in items if it["pid"] != test_pid and it["pid"] != val_pid]
+        yield train_items, val_items, test_items, f"LOSO-{test_pid}"
+
+def generate_kfold_splits(items, k, seed):
+    ys = np.array([it["y42"] for it in items])
+    kf = StratifiedKFold(n_splits=k, shuffle=True, random_state=seed)
+    for fold_idx, (tr_idx, te_idx) in enumerate(kf.split(np.zeros(len(ys)), ys)):
+        tr_idx = list(tr_idx)
+        np.random.shuffle(tr_idx)
+        n_val = max(1, int(0.1 * len(tr_idx)))
+        va_idx = tr_idx[:n_val]
+        tr_idx = tr_idx[n_val:]
+        train_items = [items[i] for i in tr_idx]
+        val_items = [items[i] for i in va_idx]
+        test_items = [items[i] for i in te_idx]
+        yield train_items, val_items, test_items, f"fold-{fold_idx + 1}"
+
+# ----------------------------
+# Main (LOSO/K-fold, best fold selection, saving both models & evals)
 # ----------------------------
 def main():
     args = parse_args()
@@ -242,27 +286,24 @@ def main():
         print("No training clips found."); return
 
     # Stats
-    ys_all = np.array([it["y42"] for it in items], dtype=int)
-    print(f"Global: N={len(items)}, min_valid~{min(it['valid'].mean() for it in items):.2f}")
-    # Split
-    kf = StratifiedKFold(n_splits=args.k, shuffle=True, random_state=args.seed)
+    print(f"Global: N={len(items)}, min_valid~{min(it[‘valid’].mean() for it in items):.2f}")
+
+    # Generate splits
+    if args.eval_mode == "loso":
+        splits = list(generate_loso_splits(items))
+    else:
+        splits = list(generate_kfold_splits(items, args.k, args.seed))
+    print(f"Evaluation: {args.eval_mode} — {len(splits)} folds")
 
     best_macro42 = -1.0
     best_artifact_42 = None
     best_reports = None
 
-    fold = 0
-    for tr_idx, te_idx in kf.split(np.zeros(len(ys_all)), ys_all):
-        fold += 1
-        # we’ll carve a val split out of train (10%)
-        tr_idx = np.array(tr_idx); te_idx = np.array(te_idx)
-        np.random.shuffle(tr_idx)
-        n_val = max(1, int(0.1 * len(tr_idx)))
-        va_idx, tr_idx = tr_idx[:n_val], tr_idx[n_val:]
-
-        train_items = [items[i] for i in tr_idx]
-        val_items   = [items[i] for i in va_idx]
-        test_items  = [items[i] for i in te_idx]
+    for fold, (train_items, val_items, test_items, fold_name) in enumerate(splits, 1):
+        print(f"\n{‘=’*60}")
+        print(f"Fold {fold}/{len(splits)}: {fold_name}  "
+              f"(train={len(train_items)} val={len(val_items)} test={len(test_items)})")
+        print(f"{‘=’*60}")
 
         # Fit standardization on train
         Xtr = np.stack([it["X"] for it in train_items], 0)  # [N,T,F]
@@ -299,7 +340,7 @@ def main():
             f1_va_42 = macro_f1(y42_val, p42_val, 42)
             f1_va_7  = macro_f1(y7_val,  p7_val,  7)
 
-            print(f"[Fold {fold:02d} | Epoch {ep:03d}] loss={tr_loss:.4f}  F1_42={f1_va_42:.3f}  F1_7={f1_va_7:.3f}")
+            print(f"[{fold_name} | Epoch {ep:03d}] loss={tr_loss:.4f}  F1_42={f1_va_42:.3f}  F1_7={f1_va_7:.3f}")
 
             if (best_f1_va_42 is None) or (f1_va_42 > best_f1_va_42):
                 best_f1_va_42 = f1_va_42
@@ -308,7 +349,7 @@ def main():
             else:
                 noimp += 1
                 if noimp >= args.patience:
-                    print(f"[Fold {fold:02d}] Early stop at epoch {ep} (best F1_42={best_f1_va_42:.3f})")
+                    print(f"[{fold_name}] Early stop at epoch {ep} (best F1_42={best_f1_va_42:.3f})")
                     break
 
         # Test with best weights for this fold
@@ -321,7 +362,7 @@ def main():
         f1_te_42 = macro_f1(y42_te,  p42_te,  42)
         f1_te_7  = macro_f1(y7_te,   p7_te,   7)
 
-        print(f"[Fold {fold:02d} DONE]  VAL: F1_42={f1_va_42:.3f} F1_7={f1_va_7:.3f}   "
+        print(f"[{fold_name} DONE]  VAL: F1_42={f1_va_42:.3f} F1_7={f1_va_7:.3f}   "
               f"TEST: F1_42={f1_te_42:.3f} F1_7={f1_te_7:.3f}")
 
         # Keep best fold by 42-way macro-F1 (primary metric)
@@ -345,7 +386,7 @@ def main():
             best_reports = dict(
                 val=dict(F1_42=f1_va_42, F1_7=f1_va_7, report_42=rep_val_42, report_7=rep_val_7),
                 test=dict(F1_42=f1_te_42, F1_7=f1_te_7, report_42=rep_te_42, report_7=rep_te_7),
-                fold=fold
+                fold=fold_name
             )
 
     # -------------- Save outputs --------------
