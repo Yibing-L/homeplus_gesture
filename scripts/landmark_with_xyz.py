@@ -41,6 +41,7 @@ INCLUDE_SCALE_CH = True
 
 CLIP_FEATURES_ABS = 50.0
 EPS = 1e-6
+HAND_MIN_VALID = 6  # minimum joints with valid depth to treat frame as valid
 
 STREAM_W = 640
 STREAM_H = 480
@@ -126,10 +127,15 @@ def get_depth_m(depth_img, x, y, depth_scale):
     return float(d) * depth_scale
 
 
-def metric_hand_scale(hand_xyz_wrist_rel):
-    """Stable scale in meters: wrist-to-middle-MCP distance (from wrist-relative coords)."""
-    # hand_xyz_wrist_rel[0] is the wrist (all zeros), [9] is middle MCP
-    return float(max(np.linalg.norm(hand_xyz_wrist_rel[9]), EPS))
+def metric_hand_scale(hand_xyz_wrist_rel, joint_valid):
+    """Stable scale in meters: average of available wrist→MCP distances (joints 5, 9, 17)."""
+    dists = []
+    for j in [5, 9, 17]:
+        if joint_valid[j]:
+            d = float(np.linalg.norm(hand_xyz_wrist_rel[j]))
+            if np.isfinite(d) and d > EPS:
+                dists.append(d)
+    return float(max(np.mean(dists) if dists else EPS, EPS))
 
 
 def resample_2d(arr, T):
@@ -189,8 +195,12 @@ def _list_participant_dirs(base_dir):
     out = []
     for name in os.listdir(base_dir):
         full = os.path.join(base_dir, name)
-        if os.path.isdir(full) and re.fullmatch(r"\d+", name):
-            out.append((int(name), name, full))
+        if not os.path.isdir(full):
+            continue
+        # Accept plain integers ("0", "1", ...) or "{N}_done" ("0_done", "2_done", ...)
+        m = re.fullmatch(r"(\d+)(?:_done)?", name)
+        if m:
+            out.append((int(m.group(1)), name, full))
     out.sort(key=lambda x: x[0])
     return out
 
@@ -243,7 +253,7 @@ def main():
         hol.close()
         sys.exit(0)
 
-    for _, participant_name, DATA_DIR in participant_dirs:
+    for participant_id, participant_name, DATA_DIR in participant_dirs:
         OUTPUT_DIR = os.path.join(output_root, participant_name)
         os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -299,7 +309,9 @@ def main():
                         lm = res.pose_landmarks.landmark
 
                         def px(idx):
-                            return int(lm[idx].x * W), int(lm[idx].y * H), lm[idx].visibility
+                            x = int(np.clip(lm[idx].x * W, 0, W - 1))
+                            y = int(np.clip(lm[idx].y * H, 0, H - 1))
+                            return x, y, lm[idx].visibility
 
                         for ji, mp_idx in enumerate([R_SHOULDER, R_ELBOW, R_WRIST]):
                             jx, jy, jvis = px(mp_idx)
@@ -326,7 +338,9 @@ def main():
                         for j, jlm in enumerate(chosen.landmark):
                             u_j = jlm.x * W
                             v_j = jlm.y * H
-                            dz = get_depth_m(depth, int(round(u_j)), int(round(v_j)), depth_scale)
+                            u_px = min(max(int(round(u_j)), 0), W - 1)
+                            v_px = min(max(int(round(v_j)), 0), H - 1)
+                            dz = get_depth_m(depth, u_px, v_px, depth_scale)
                             hand_uvd[j, 0] = u_j
                             hand_uvd[j, 1] = v_j
                             if dz is not None:
@@ -335,53 +349,61 @@ def main():
 
                         # Wrist must have depth to proceed
                         wrist_u, wrist_v, wrist_d = hand_uvd[0]
-                        if np.isfinite(wrist_d) and wrist_d > 0:
-                            wrist_xyz[:] = deproject(intr, wrist_u, wrist_v, wrist_d)
+                        wrist_u_dep = float(np.clip(wrist_u, 0, W - 1))
+                        wrist_v_dep = float(np.clip(wrist_v, 0, H - 1))
+                        if np.isfinite(wrist_d) and wrist_d > 0 and joint_valid.sum() >= HAND_MIN_VALID:
+                            wrist_xyz[:] = deproject(intr, wrist_u_dep, wrist_v_dep, wrist_d)
 
                             # Deproject all hand joints, make wrist-relative (meters)
                             for j in range(21):
                                 if joint_valid[j]:
+                                    u_dep = float(np.clip(hand_uvd[j, 0], 0, W - 1))
+                                    v_dep = float(np.clip(hand_uvd[j, 1], 0, H - 1))
                                     j_xyz = np.array(deproject(
-                                        intr, hand_uvd[j, 0], hand_uvd[j, 1], hand_uvd[j, 2]
+                                        intr, u_dep, v_dep, hand_uvd[j, 2]
                                     ), dtype=np.float32)
                                     hand_xyz_m[j] = j_xyz - wrist_xyz
 
-                            # Metric scale: wrist-to-middle-MCP distance in meters
-                            if joint_valid[9]:
-                                scale_m = metric_hand_scale(hand_xyz_m)
+                            # Metric scale: fallback chain (MCP avg → joint 9 → joint 5)
+                            if any(joint_valid[j] for j in [5, 9, 17]):
+                                scale_m = metric_hand_scale(hand_xyz_m, joint_valid)
+                            elif joint_valid[9]:
+                                scale_m = float(max(np.linalg.norm(hand_xyz_m[9]), EPS))
                             elif joint_valid[5]:
                                 scale_m = float(max(np.linalg.norm(hand_xyz_m[5]), EPS))
 
-                            # Scale-normalized (unitless) copy
-                            if np.isfinite(scale_m) and scale_m > EPS:
+                            if not (np.isfinite(scale_m) and scale_m > EPS):
+                                # No usable scale — treat as invalid frame
+                                pass
+                            else:
+                                # Scale-normalize and zero out missing joints
                                 hand_xyz_norm = hand_xyz_m / scale_m
-                            else:
-                                hand_xyz_norm = hand_xyz_m.copy()
+                                hand_xyz_norm[joint_valid == 0] = 0.0
 
-                            # Deproject each arm joint independently (no all-or-nothing gate)
-                            for j in range(3):
-                                if arm_joint_valid[j]:
-                                    j_xyz = np.array(deproject(
-                                        intr, arm_uvd[j, 0], arm_uvd[j, 1], arm_uvd[j, 2]
-                                    ), dtype=np.float32)
-                                    arm_xyz_m[j] = j_xyz - wrist_xyz
-                            if np.isfinite(scale_m) and scale_m > EPS:
+                                # Deproject each arm joint independently (no all-or-nothing gate)
+                                for j in range(3):
+                                    if arm_joint_valid[j]:
+                                        u_dep = float(np.clip(arm_uvd[j, 0], 0, W - 1))
+                                        v_dep = float(np.clip(arm_uvd[j, 1], 0, H - 1))
+                                        j_xyz = np.array(deproject(
+                                            intr, u_dep, v_dep, arm_uvd[j, 2]
+                                        ), dtype=np.float32)
+                                        arm_xyz_m[j] = j_xyz - wrist_xyz
                                 arm_xyz_norm = arm_xyz_m / scale_m
-                            else:
-                                arm_xyz_norm = arm_xyz_m.copy()
+                                arm_xyz_norm[arm_joint_valid == 0] = 0.0
 
-                            hand_uvd_seq.append(hand_uvd)
-                            hand_xyz_m_seq.append(hand_xyz_m)
-                            hand_xyz_norm_seq.append(hand_xyz_norm)
-                            arm_uvd_seq.append(arm_uvd)
-                            arm_xyz_m_seq.append(arm_xyz_m)
-                            arm_xyz_norm_seq.append(arm_xyz_norm)
-                            wrist_xyz_seq.append(wrist_xyz)
-                            scale_m_seq.append(scale_m)
-                            valid_seq.append(True)
-                            valid_joint_seq.append(joint_valid)
-                            valid_arm_joint_seq.append(arm_joint_valid)
-                            continue
+                                hand_uvd_seq.append(hand_uvd)
+                                hand_xyz_m_seq.append(hand_xyz_m)
+                                hand_xyz_norm_seq.append(hand_xyz_norm)
+                                arm_uvd_seq.append(arm_uvd)
+                                arm_xyz_m_seq.append(arm_xyz_m)
+                                arm_xyz_norm_seq.append(arm_xyz_norm)
+                                wrist_xyz_seq.append(wrist_xyz)
+                                scale_m_seq.append(scale_m)
+                                valid_seq.append(True)
+                                valid_joint_seq.append(joint_valid)
+                                valid_arm_joint_seq.append(arm_joint_valid)
+                                continue
 
                     # Invalid frame (no hand or no wrist depth)
                     hand_uvd_seq.append(hand_uvd)
@@ -432,6 +454,14 @@ def main():
                         np.nan_to_num(scale_col, nan=0.0), T_TARGET
                     )
 
+                # Validity masks resampled to T_TARGET then re-thresholded to binary {0,1}
+                valid_joint_T = (resample_2d(
+                    valid_joint_arr.astype(np.float32), T_TARGET
+                ) > 0.5).astype(np.float32)  # (T, 21)
+                valid_arm_joint_T = (resample_2d(
+                    valid_arm_joint_arr.astype(np.float32), T_TARGET
+                ) > 0.5).astype(np.float32)  # (T, 3)
+
                 # Velocity (valid-aware)
                 feat_chunks = [pose_T]
                 if INCLUDE_VELOCITY:
@@ -450,8 +480,19 @@ def main():
                 if scale_T is not None:
                     feat_chunks.append(scale_T)
 
+                # Validity channels: frame-level, per-joint, coverage scalars
+                feat_chunks.append(valid_T.astype(np.float32)[:, None])        # (T, 1)
+                feat_chunks.append(valid_joint_T)                               # (T, 21)
+                feat_chunks.append(valid_arm_joint_T)                          # (T, 3)
+                feat_chunks.append(valid_joint_T.mean(axis=1, keepdims=True))  # (T, 1) hand coverage
+                feat_chunks.append(valid_arm_joint_T.mean(axis=1, keepdims=True))  # (T, 1) arm coverage
+
                 X = np.concatenate(feat_chunks, axis=1).astype(np.float32)
-                X = np.clip(X, -CLIP_FEATURES_ABS, CLIP_FEATURES_ABS)
+                # Clip only continuous channels (pose, velocity, scale); validity masks are already {0,1}
+                # Validity cols appended last: valid_T(1) + valid_joint(21) + valid_arm(3) + cov_hand(1) + cov_arm(1) = 27
+                n_validity_cols = 1 + 21 + 3 + 1 + 1
+                continuous_dim = X.shape[1] - n_validity_cols
+                X[:, :continuous_dim] = np.clip(X[:, :continuous_dim], -CLIP_FEATURES_ABS, CLIP_FEATURES_ABS)
                 X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
 
                 # ── Save ──
@@ -462,7 +503,7 @@ def main():
                     X=X,
                     valid_T=valid_T.astype(np.float32),
                     label=label,
-                    subject_id=int(participant_name),
+                    subject_id=participant_id,
                     hand_xyz_m=hand_xyz_m_arr,         # (t, 21, 3) wrist-rel, meters
                     hand_xyz_norm=hand_xyz_norm_arr,   # (t, 21, 3) wrist-rel, scale-norm (unitless)
                     hand_uvd=hand_uvd_arr,             # (t, 21, 3) raw pixels + depth_m
@@ -484,9 +525,11 @@ def main():
                 )
                 arm_depth_rate = (valid_arm_joint_arr[valid_arr].mean()
                                   if valid_arr.any() else float('nan'))
+                jd_all  = valid_joint_arr.mean()
+                jd_good = valid_joint_arr[valid_arr].mean() if valid_arr.any() else float('nan')
                 print(f"[OK] {file} -> {out_path} | X {X.shape} | "
                       f"frames {len(valid_arr)} | valid {valid_arr.sum()}/{len(valid_arr)} | "
-                      f"hand_joint_depth {valid_joint_arr[valid_arr].mean():.2f} | "
+                      f"hand_joint_depth all={jd_all:.2f} good={jd_good:.2f} | "
                       f"arm_joint_depth {arm_depth_rate:.2f}")
 
                 # ── Stats ──
