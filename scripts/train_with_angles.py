@@ -174,6 +174,10 @@ def parse_args():
     ap.add_argument("--aug_block_mask_prob", type=float, default=0.05)
     ap.add_argument("--aug_scale_jitter", action="store_true", default=True)
     ap.add_argument("--no_aug_scale_jitter", action="store_true")
+    ap.add_argument("--aug_scale_lo", type=float, default=0.5,
+                    help="Lower bound for scale_jitter multiplier (default 0.5 to cover small hands)")
+    ap.add_argument("--aug_scale_hi", type=float, default=1.2,
+                    help="Upper bound for scale_jitter multiplier")
     ap.add_argument("--aug_rotate_prob", type=float, default=0.5,
                     help="Probability of applying in-plane pose rotation per sample")
     ap.add_argument("--aug_rotate_max_deg", type=float, default=15.0,
@@ -182,6 +186,10 @@ def parse_args():
                     help="Probability of applying random temporal crop per sample")
     ap.add_argument("--mixup_alpha", type=float, default=0.2,
                     help="Beta distribution alpha for Mixup (0 = disabled)")
+    ap.add_argument("--normalize_scale_channel", action="store_true", default=True,
+                    help="Normalize channel 147 (bone-length scale) by training-fold mean, "
+                         "reducing between-subject OOD shift. No conflict with bone-normalized XYZ.")
+    ap.add_argument("--no_normalize_scale_channel", action="store_true")
 
     ap.add_argument("--clip_norm", action="store_true", default=True)
     ap.add_argument("--no_clip_norm", action="store_true")
@@ -195,6 +203,8 @@ def parse_args():
         args.aug_scale_jitter = False
     if args.no_clip_norm:
         args.clip_norm = False
+    if args.no_normalize_scale_channel:
+        args.normalize_scale_channel = False
     return args
 
 
@@ -344,8 +354,11 @@ def feature_block_mask(X, prob=0.05):
     return X_out
 
 
-def scale_jitter(X, lo=0.8, hi=1.2):
-    """Scale pose+velocity XYZ channels. Angles are scale-invariant — not touched."""
+def scale_jitter(X, lo=0.5, hi=1.2):
+    """Scale pose+velocity XYZ channels. Angles are scale-invariant — not touched.
+
+    Default lo=0.5 (was 0.8) to cover subjects with small hands / low bone-length scale.
+    """
     X_out = X.copy()
     X_out[:, :144] *= np.random.uniform(lo, hi)
     return X_out
@@ -436,7 +449,8 @@ class AugmentedClipSet(Dataset):
             if self.cfg.get("block_mask_prob", 0.05) > 0:
                 X = feature_block_mask(X, self.cfg.get("block_mask_prob", 0.05))
             if self.cfg.get("scale_jitter", True):
-                X = scale_jitter(X)
+                X = scale_jitter(X, lo=self.cfg.get("scale_lo", 0.5),
+                                    hi=self.cfg.get("scale_hi", 1.2))
             if self.cfg.get("rotate_prob", 0.0) > 0 and np.random.rand() < self.cfg.get("rotate_prob", 0.0):
                 X = rotate_pose(X, self.cfg.get("rotate_max_deg", 15.0))
 
@@ -512,19 +526,33 @@ class AttentionBiLSTM(nn.Module):
 # ================================================================
 # Standardization — continuous channels only
 # ================================================================
-def standardize_fit(train_items):
+# Channel index of the bone-length scale within the 207-dim feature vector.
+# Layout: pose(72) + vel_pose(72) + vel_wrist(3) + scale(1) = index 147.
+_SCALE_CH = 147
+
+
+def standardize_fit(train_items, normalize_scale=True):
     Xtr = np.stack([it["X"] for it in train_items], 0)
     Xc = Xtr[:, :, :N_CONTINUOUS]
     mu = Xc.mean(axis=(0, 1), keepdims=True).astype(np.float32)
     sd = Xc.std(axis=(0, 1), keepdims=True).astype(np.float32)
     sd[sd < 1e-6] = 1.0
-    return mu, sd
+    # Fit per-fold mean of the raw (pre-standardization) scale channel so we
+    # can divide it out in standardize_apply, removing between-subject OOD shift.
+    scale_mean = float(Xtr[:, :, _SCALE_CH].mean()) if normalize_scale else None
+    return mu, sd, scale_mean
 
 
-def standardize_apply(items, mu, sd):
+def standardize_apply(items, mu, sd, scale_mean=None):
     out = []
     for it in items:
         X = it["X"].copy()
+        # Optionally normalize scale channel BEFORE global standardization so
+        # that between-subject absolute scale differences don't cause OOD shifts.
+        # The XYZ pose channels are already bone-length normalized, so this is
+        # safe — it only removes the redundant absolute-size information.
+        if scale_mean is not None and scale_mean > 1e-8:
+            X[:, _SCALE_CH] /= scale_mean
         X[:, :N_CONTINUOUS] = (X[:, :N_CONTINUOUS] - mu.squeeze(0)) / (sd.squeeze(0) + 1e-8)
         out.append(dict(X=X.astype(np.float32), valid=it["valid"],
                         y42=it["y42"], pid=it.get("pid", "?"), path=it.get("path", "")))
@@ -690,6 +718,8 @@ def main():
         rotate_prob=args.aug_rotate_prob,
         rotate_max_deg=args.aug_rotate_max_deg,
         temporal_crop_prob=args.aug_temporal_crop_prob,
+        scale_lo=args.aug_scale_lo,
+        scale_hi=args.aug_scale_hi,
     )
     mixup_alpha = 0.0 if args.no_aug else args.mixup_alpha
 
@@ -699,7 +729,7 @@ def main():
 
     all_y_test, all_p_test, all_preds_with_pid = [], [], []
     fold_results = []
-    best_global_f1, best_global_state, best_global_mu, best_global_sd = -1.0, None, None, None
+    best_global_f1, best_global_state, best_global_mu, best_global_sd, best_global_scale_mean = -1.0, None, None, None, None
     best_global_val_f1 = -1.0
     best_global_fold = None
 
@@ -709,10 +739,10 @@ def main():
                  f"(train={len(train_items)} val={len(val_items)} test={len(test_items)})")
         log.info(f"{'='*60}")
 
-        mu, sd = standardize_fit(train_items)
-        train_std = standardize_apply(train_items, mu, sd)
-        val_std   = standardize_apply(val_items,   mu, sd)
-        test_std  = standardize_apply(test_items,  mu, sd)
+        mu, sd, scale_mean = standardize_fit(train_items, args.normalize_scale_channel)
+        train_std = standardize_apply(train_items, mu, sd, scale_mean)
+        val_std   = standardize_apply(val_items,   mu, sd, scale_mean)
+        test_std  = standardize_apply(test_items,  mu, sd, scale_mean)
 
         ds_train = AugmentedClipSet(train_std, augment=(aug_cfg is not None),
                                     aug_cfg=aug_cfg, clip_norm=args.clip_norm)
@@ -782,7 +812,7 @@ def main():
             best_global_f1 = tf1
             best_global_val_f1 = float(best_val_f1)
             best_global_fold = fold_name
-            best_global_state, best_global_mu, best_global_sd = best_state, mu, sd
+            best_global_state, best_global_mu, best_global_sd, best_global_scale_mean = best_state, mu, sd, scale_mean
 
     # Aggregate
     all_y = np.concatenate(all_y_test); all_p = np.concatenate(all_p_test)
@@ -830,6 +860,7 @@ def main():
                     attn_heads=args.attn_heads, proj_dim=args.proj_dim, dropout=args.dropout,
                     mu=best_global_mu.squeeze().astype(np.float32),
                     sd=best_global_sd.squeeze().astype(np.float32),
+                    scale_mean=float(best_global_scale_mean) if best_global_scale_mean is not None else None,
                     state_dict=best_global_state,
                     # provenance / eval metadata
                     roots=[str(r) for r in args.roots],
