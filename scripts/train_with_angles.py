@@ -285,6 +285,18 @@ def load_items(roots):
 # ================================================================
 # Augmentation
 # ================================================================
+def _fix_binary_channels(X):
+    """Round binary validity channels back to 0/1 after temporal interpolation.
+
+    Channels [N_CONTINUOUS:] contain binary flags that get fractional values
+    when frames are interpolated. Channels [189:191] (hand_cov, arm_cov) are
+    continuous means — they are also rounded here since they are means of binary
+    values and rounding is safe for augmented data.
+    """
+    X[:, N_CONTINUOUS:] = (X[:, N_CONTINUOUS:] >= 0.5).astype(np.float32)
+    return X
+
+
 def speed_perturb(X, valid, lo=0.85, hi=1.15):
     T, F = X.shape
     speed = np.random.uniform(lo, hi)
@@ -300,6 +312,7 @@ def speed_perturb(X, valid, lo=0.85, hi=1.15):
     hi2 = np.clip(lo2 + 1, 0, new_T - 1)
     w2 = (idx2 - lo2)[:, None]
     X_out = ((1 - w2) * X_new[lo2] + w2 * X_new[hi2]).astype(np.float32)
+    X_out = _fix_binary_channels(X_out)
     v_out = np.interp(np.linspace(0, new_T - 1, T), np.arange(new_T), v_new.astype(np.float32)) > 0.5
     return X_out, v_out
 
@@ -313,6 +326,7 @@ def time_warp(X, valid, sigma=0.2):
     hi_idx = lo_idx + 1
     w = (warp - lo_idx)[:, None]
     X_out = ((1 - w) * X[lo_idx] + w * X[hi_idx]).astype(np.float32)
+    X_out = _fix_binary_channels(X_out)
     v_float = valid.astype(np.float32)
     v_out = ((1 - w.squeeze()) * v_float[lo_idx] + w.squeeze() * v_float[hi_idx]) > 0.5
     return X_out, v_out
@@ -411,6 +425,7 @@ def temporal_crop(X, valid, min_frac=0.7):
     hi_i = np.clip(lo_i + 1, 0, crop_len - 1)
     w = (idx - lo_i)[:, None]
     X_out = ((1 - w) * X_crop[lo_i] + w * X_crop[hi_i]).astype(np.float32)
+    X_out = _fix_binary_channels(X_out)
     v_out = np.interp(np.linspace(0, crop_len - 1, T),
                       np.arange(crop_len), v_crop) > 0.5
     return X_out, v_out
