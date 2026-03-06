@@ -174,8 +174,8 @@ def parse_args():
     ap.add_argument("--aug_block_mask_prob", type=float, default=0.05)
     ap.add_argument("--aug_scale_jitter", action="store_true", default=True)
     ap.add_argument("--no_aug_scale_jitter", action="store_true")
-    ap.add_argument("--aug_scale_lo", type=float, default=0.5,
-                    help="Lower bound for scale_jitter multiplier (default 0.5 to cover small hands)")
+    ap.add_argument("--aug_scale_lo", type=float, default=0.7,
+                    help="Lower bound for scale_jitter multiplier (default 0.7 to cover small hands)")
     ap.add_argument("--aug_scale_hi", type=float, default=1.2,
                     help="Upper bound for scale_jitter multiplier")
     ap.add_argument("--aug_rotate_prob", type=float, default=0.5,
@@ -605,7 +605,7 @@ def derive_head_7_from_42(state_dict):
 # ================================================================
 def train_epoch(model, loader, optimizer, scheduler, criterion, device, clip_grad, mixup_alpha=0.0):
     model.train()
-    total_loss = 0.0; n_samples = 0
+    total_loss = 0.0; n_samples = 0; n_skipped = 0
     for X, M, y in loader:
         X, M, y = X.to(device), M.to(device), y.to(device)
         if mixup_alpha > 0 and np.random.rand() < 0.5:
@@ -617,11 +617,18 @@ def train_epoch(model, loader, optimizer, scheduler, criterion, device, clip_gra
             loss = lam * criterion(logits, y) + (1 - lam) * criterion(logits, y[idx])
         else:
             loss = criterion(model(X, M), y)
+        if not torch.isfinite(loss):
+            n_skipped += 1
+            optimizer.zero_grad()
+            scheduler.step()
+            continue
         optimizer.zero_grad(); loss.backward()
         if clip_grad > 0:
             clip_grad_norm_(model.parameters(), clip_grad)
         optimizer.step(); scheduler.step()
         total_loss += loss.item() * X.size(0); n_samples += X.size(0)
+    if n_skipped:
+        logging.getLogger(__name__).warning(f"Skipped {n_skipped} NaN/Inf batches this epoch")
     return total_loss / max(1, n_samples)
 
 
