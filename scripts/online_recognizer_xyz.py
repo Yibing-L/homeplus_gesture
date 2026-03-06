@@ -637,12 +637,15 @@ def main():
             bgr   = np.asanyarray(color_frame.get_data())
             depth = np.asanyarray(depth_frame.get_data())  # uint16, mm
 
-            # Stride: skip frames to reduce CPU load
-            if (frame_idx % max(1, args.stride_frames)) != 0:
-                frame_idx += 1
-                fb.append_invalid()
-                continue
+            # Stride: skip frames to reduce CPU load.
+            # Do NOT append_invalid for skipped frames — that would corrupt the
+            # feature buffer with artificial zero-frames and halve the valid ratio.
             frame_idx += 1
+            if (frame_idx % max(1, args.stride_frames)) != 0:
+                cv2.imshow("Online Recognizer XYZ", bgr)
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    break
+                continue
 
             # Run Holistic and extract XYZ features
             result = hol_proc.process(bgr)
