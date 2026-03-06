@@ -626,6 +626,7 @@ def main():
     frame_idx   = 0
     infer_idx   = 0   # counts MediaPipe-processed frames for inference stride
     idle_frames = 0   # consecutive frames below hand_motion_thresh
+    last_display = None  # last rendered frame (with HUD) — shown on stride-skipped frames
 
     try:
         while True:
@@ -646,7 +647,9 @@ def main():
             # feature buffer with artificial zero-frames and halve the valid ratio.
             frame_idx += 1
             if (frame_idx % max(1, args.stride_frames)) != 0:
-                cv2.imshow("Online Recognizer XYZ", bgr)
+                # Show the last rendered frame (with HUD) to avoid flicker
+                if last_display is not None:
+                    cv2.imshow("Online Recognizer XYZ", last_display)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
                 continue
@@ -727,6 +730,7 @@ def main():
                         0.65, (0, 255, 0) if public_label is not None else (128, 128, 128),
                         2, cv2.LINE_AA)
 
+            last_display = bgr
             cv2.imshow("Online Recognizer XYZ", bgr)
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
