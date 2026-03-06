@@ -38,6 +38,61 @@ T_TARGET        = 64
 DEPTH_SCALE     = 0.001   # Z16 uint16 mm → meters
 CLIP_ABS        = 50.0
 
+# ------------------------------------------------------------------ Angle computation
+# Mirrors train_with_angles.py exactly so models trained there get the same features.
+_HAND_TRIPLETS = [
+    (0, 1, 2), (1, 2, 3), (2, 3, 4),
+    (0, 5, 6), (5, 6, 7), (6, 7, 8),
+    (0, 9, 10), (9, 10, 11), (10, 11, 12),
+    (0, 13, 14), (13, 14, 15), (14, 15, 16),
+    (0, 17, 18), (17, 18, 19), (18, 19, 20),
+]
+_ARM_TRIPLETS = [(0, 1, 2)]
+
+
+def _insert_angles(X_raw):
+    """Expand 175-dim feature array to 207-dim by inserting joint bend angles.
+
+    Mirrors train_with_angles.py:insert_angles() so inference matches training.
+    """
+    T = X_raw.shape[0]
+    hand_xyz = X_raw[:, 0:63].reshape(T, 21, 3)
+    arm_xyz  = X_raw[:, 63:72].reshape(T, 3, 3)
+    hand_jv  = X_raw[:, 149:170].astype(bool)
+    arm_jv   = X_raw[:, 170:173].astype(bool)
+
+    angles      = np.zeros((T, 16), dtype=np.float32)
+    angle_valid = np.zeros((T, 16), dtype=np.float32)
+
+    for ai, (p, j, c) in enumerate(_HAND_TRIPLETS):
+        valid = hand_jv[:, p] & hand_jv[:, j] & hand_jv[:, c]
+        if valid.any():
+            v1 = hand_xyz[valid, p] - hand_xyz[valid, j]
+            v2 = hand_xyz[valid, c] - hand_xyz[valid, j]
+            n1 = np.linalg.norm(v1, axis=1, keepdims=True).clip(EPS)
+            n2 = np.linalg.norm(v2, axis=1, keepdims=True).clip(EPS)
+            cos_a = ((v1 / n1) * (v2 / n2)).sum(axis=1).clip(-1.0, 1.0)
+            angles[valid, ai]      = np.arccos(cos_a)
+            angle_valid[valid, ai] = 1.0
+
+    for ai, (p, j, c) in enumerate(_ARM_TRIPLETS):
+        valid = arm_jv[:, p] & arm_jv[:, j] & arm_jv[:, c]
+        if valid.any():
+            v1 = arm_xyz[valid, p] - arm_xyz[valid, j]
+            v2 = arm_xyz[valid, c] - arm_xyz[valid, j]
+            n1 = np.linalg.norm(v1, axis=1, keepdims=True).clip(EPS)
+            n2 = np.linalg.norm(v2, axis=1, keepdims=True).clip(EPS)
+            cos_a = ((v1 / n1) * (v2 / n2)).sum(axis=1).clip(-1.0, 1.0)
+            angles[valid, 15 + ai]      = np.arccos(cos_a)
+            angle_valid[valid, 15 + ai] = 1.0
+
+    return np.concatenate([
+        X_raw[:, :148],
+        angles,
+        X_raw[:, 148:],
+        angle_valid,
+    ], axis=1).astype(np.float32)
+
 # MediaPipe Holistic pose landmark indices (right arm)
 _PL         = mp.solutions.holistic.PoseLandmark
 R_SHOULDER  = _PL.RIGHT_SHOULDER.value
@@ -208,20 +263,25 @@ def build_model_from_artifact(artifact):
 
 
 def load_checkpoint(path):
-    """Load a train_xyz.py checkpoint. Returns model, mu, sd, n_continuous, n_classes."""
+    """Load a train_xyz.py or train_with_angles.py checkpoint."""
     if not path.endswith(".pt"):
         raise ValueError("Only .pt checkpoints are supported.")
     torch = importlib.import_module("torch")
     art = torch.load(path, map_location="cpu", weights_only=False)
     model = build_model_from_artifact(art)
     model.eval()
+    mtype = art.get("type", "")
+    has_angles = "angles" in mtype  # attention_bilstm_xyz_angles
     return {
         "model":        model,
-        "mu":           np.array(art["mu"], dtype=np.float32),   # (n_continuous,)
-        "sd":           np.array(art["sd"], dtype=np.float32),   # (n_continuous,)
+        "mu":           np.array(art["mu"], dtype=np.float32),
+        "sd":           np.array(art["sd"], dtype=np.float32),
         "n_continuous": int(art.get("n_continuous", 148)),
         "n_classes":    int(art["n_classes"]),
         "in_dim":       int(art["in_dim"]),
+        "has_angles":   has_angles,
+        # scale_mean is stored when --normalize_scale_channel was used at training
+        "scale_mean":   float(art["scale_mean"]) if art.get("scale_mean") is not None else None,
     }
 
 
@@ -480,12 +540,15 @@ def main():
 
     # Checkpoint
     art = load_checkpoint(args.checkpoint)
-    model       = art["model"]
-    mu          = art["mu"]           # (n_continuous,)
-    sd          = art["sd"]           # (n_continuous,)
-    n_continuous= art["n_continuous"] # 148 for train_xyz.py models
+    model        = art["model"]
+    mu           = art["mu"]
+    sd           = art["sd"]
+    n_continuous = art["n_continuous"]
+    has_angles   = art["has_angles"]
+    scale_mean   = art["scale_mean"]
     print(f"[INFO] Loaded model: {art['n_classes']}-class, in_dim={art['in_dim']}, "
-          f"n_continuous={n_continuous}")
+          f"n_continuous={n_continuous}, angles={has_angles}, "
+          f"scale_mean={scale_mean}")
 
     # RealSense setup
     pipeline = rs.pipeline()
@@ -551,6 +614,12 @@ def main():
             pred_prob = None
 
             if vratio >= args.min_valid_ratio:
+                # Expand to 207-dim if model was trained with joint angles
+                if has_angles:
+                    X = _insert_angles(X)
+                # Apply per-fold scale normalization if trained with --normalize_scale_channel
+                if scale_mean is not None and scale_mean > 1e-8:
+                    X[:, 147] /= scale_mean
                 # Standardize continuous channels only
                 X_std = X.copy()
                 X_std[:, :n_continuous] = (X[:, :n_continuous] - mu) / (sd + 1e-8)
