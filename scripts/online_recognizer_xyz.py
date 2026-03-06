@@ -111,11 +111,11 @@ def parse_args():
                     help="Sequence length the model expects")
     ap.add_argument("--stride_frames", type=int, default=2,
                     help="Process every Nth frame to reduce CPU load (>=1)")
-    ap.add_argument("--ema_alpha", type=float, default=0.2,
+    ap.add_argument("--ema_alpha", type=float, default=0.4,
                     help="EMA update rate for probability accumulation (higher=faster response)")
-    ap.add_argument("--switch_margin", type=float, default=0.15,
+    ap.add_argument("--switch_margin", type=float, default=0.05,
                     help="Hysteresis: new class must exceed current by this margin to switch")
-    ap.add_argument("--min_hold_frames", type=int, default=15,
+    ap.add_argument("--min_hold_frames", type=int, default=6,
                     help="Frames to hold a prediction before allowing switch (~0.5s at 30fps)")
     ap.add_argument("--inference_stride", type=int, default=12,
                     help="Run model every N MediaPipe frames (~5 updates per 2s gesture)")
