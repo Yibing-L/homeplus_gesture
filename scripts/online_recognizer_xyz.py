@@ -119,6 +119,10 @@ def parse_args():
                     help="Frames to hold a prediction before allowing switch (~0.5s at 30fps)")
     ap.add_argument("--inference_stride", type=int, default=12,
                     help="Run model every N MediaPipe frames (~5 updates per 2s gesture)")
+    ap.add_argument("--buffer_size", type=int, default=128,
+                    help="Rolling frame buffer size (~4.3s at 30fps). Must be >= t_target.")
+    ap.add_argument("--window_stride", type=int, default=8,
+                    help="Stride between 64-frame windows extracted from buffer for voting")
     ap.add_argument("--confidence_thresh", type=float, default=0.45,
                     help="Min EMA max-prob to emit any prediction (else show idle)")
     ap.add_argument("--hand_motion_thresh", type=float, default=0.06,
@@ -299,12 +303,10 @@ def load_checkpoint(path):
 class FeatureBufferXYZ:
     """Accumulates per-frame XYZ features, assembles 175-dim windows matching landmark_with_xyz.py."""
 
-    def __init__(self, intr, t_target=64):
-        self.intr = intr          # rs.intrinsics from the connected camera
-        self.t_target = t_target
-        # Each entry: (hand_xyz_norm[21,3], arm_xyz_norm[3,3], wrist_xyz[3],
-        #              scale_m, valid_joint[21], valid_arm_joint[3], valid)
-        self.buf = collections.deque(maxlen=256)
+    def __init__(self, intr, t_target=64, buffer_size=128):
+        self.intr      = intr
+        self.t_target  = t_target
+        self.buf       = collections.deque(maxlen=max(buffer_size, t_target))
 
     def append_frame(self, bgr, depth, hol_result):
         """Extract per-frame XYZ features from a Holistic result and push to buffer."""
@@ -406,79 +408,74 @@ class FeatureBufferXYZ:
             False,
         ))
 
-    def assemble_window(self):
-        """Build (T, 175) feature array matching landmark_with_xyz.py output exactly.
+    def _build_features_from_slice(self, frames):
+        """Build (T, 175) feature array from exactly T_TARGET frame tuples — no resampling.
 
-        Also returns hand_motion: temporal std of wrist-relative hand joint positions
-        over valid frames (bone-normalized units). Low value = hand is stationary = idle.
+        Each window is native-rate frames matching the training distribution exactly.
         """
-        if len(self.buf) == 0:
-            return None
-
-        hand_xyz_norm_seq  = np.stack([b[0] for b in self.buf], 0)  # (t, 21, 3)
-        arm_xyz_norm_seq   = np.stack([b[1] for b in self.buf], 0)  # (t, 3, 3)
-        wrist_xyz_seq      = np.stack([b[2] for b in self.buf], 0)  # (t, 3)
-        scale_m_seq        = np.array([b[3] for b in self.buf], dtype=np.float32)   # (t,)
-        valid_joint_seq    = np.stack([b[4] for b in self.buf], 0)  # (t, 21)
-        valid_arm_joint_seq= np.stack([b[5] for b in self.buf], 0)  # (t, 3)
-        valid_seq          = np.array([b[6] for b in self.buf], dtype=bool)         # (t,)
-
-        # ── Activity metric: std of hand joint positions across valid frames ──
-        # joints [1:21] are wrist-relative & bone-normalized → captures all hand
-        # configuration changes (finger bending, spreading, orientation) without
-        # depending on whether the wrist itself translates.
-        hand_valid = hand_xyz_norm_seq[valid_seq, 1:, :]  # (n_valid, 20, 3)
-        hand_motion = float(hand_valid.std(axis=0).mean()) if len(hand_valid) > 1 else 0.0
-
         T = self.t_target
+        hand_xyz_norm_seq   = np.stack([b[0] for b in frames], 0).astype(np.float32)
+        arm_xyz_norm_seq    = np.stack([b[1] for b in frames], 0).astype(np.float32)
+        wrist_xyz_seq       = np.nan_to_num(np.stack([b[2] for b in frames], 0), nan=0.0)
+        scale_m_seq         = np.nan_to_num(np.array([b[3] for b in frames], dtype=np.float32), nan=0.0)
+        valid_joint_T       = np.stack([b[4] for b in frames], 0).astype(np.float32)   # (T, 21)
+        valid_arm_joint_T   = np.stack([b[5] for b in frames], 0).astype(np.float32)   # (T, 3)
+        valid_T             = np.array([b[6] for b in frames], dtype=bool)              # (T,)
 
-        # ── Pose feature ──
-        pose_feat = np.concatenate([hand_xyz_norm_seq, arm_xyz_norm_seq], axis=1)  # (t, 24, 3)
-        t_len = pose_feat.shape[0]
-        pose_2d = pose_feat.reshape(t_len, 72).astype(np.float32)
+        pose_2d = np.concatenate([hand_xyz_norm_seq, arm_xyz_norm_seq], axis=1).reshape(T, 72)
 
-        # ── Resample everything to T_TARGET ──
-        pose_T      = resample_2d(pose_2d, T)
-        wrist_xyz_T = resample_2d(np.nan_to_num(wrist_xyz_seq, nan=0.0), T)
-        scale_T     = resample_2d(np.nan_to_num(scale_m_seq[:, None], nan=0.0), T)
-        valid_T     = resample_mask(valid_seq, T)
-
-        valid_joint_T     = (resample_2d(valid_joint_seq.astype(np.float32), T)
-                             > 0.5).astype(np.float32)       # (T, 21)
-        valid_arm_joint_T = (resample_2d(valid_arm_joint_seq.astype(np.float32), T)
-                             > 0.5).astype(np.float32)       # (T, 3)
-
-        # ── Velocity (valid-aware) ──
-        d_pose  = make_velocity(pose_T)
-        d_wrist = make_velocity(wrist_xyz_T)
-
+        d_pose  = make_velocity(pose_2d)
+        d_wrist = make_velocity(wrist_xyz_seq)
         bad_now  = ~valid_T
         bad_prev = np.concatenate([[bad_now[0]], bad_now[:-1]])
         bad = (bad_now | bad_prev)[:, None]
-        d_pose[bad.repeat(d_pose.shape[1],  axis=1)] = 0.0
-        d_wrist[bad.repeat(3,               axis=1)] = 0.0
+        d_pose[bad.repeat(72, axis=1)]  = 0.0
+        d_wrist[bad.repeat(3, axis=1)]  = 0.0
         d_pose  = normalize_velocity_per_clip(d_pose)
         d_wrist = normalize_velocity_per_clip(d_wrist)
 
-        # ── Assemble X (175-dim, matching landmark_with_xyz.py) ──
-        feat_chunks = [
-            pose_T,                                           # [0:72]   pose
-            d_pose,                                           # [72:144]  vel_pose
+        X = np.concatenate([
+            pose_2d,                                          # [0:72]   pose
+            d_pose,                                           # [72:144] vel_pose
             d_wrist,                                          # [144:147] vel_wrist
-            scale_T,                                          # [147:148] scale
+            scale_m_seq[:, None],                             # [147:148] scale
             valid_T.astype(np.float32)[:, None],              # [148:149] frame_valid
             valid_joint_T,                                    # [149:170] joint_valid_hand
             valid_arm_joint_T,                                # [170:173] joint_valid_arm
             valid_joint_T.mean(axis=1, keepdims=True),        # [173:174] hand_coverage
             valid_arm_joint_T.mean(axis=1, keepdims=True),    # [174:175] arm_coverage
-        ]
-        X = np.concatenate(feat_chunks, axis=1).astype(np.float32)
+        ], axis=1).astype(np.float32)
 
-        # Clip only continuous channels; validity channels are already binary
         X[:, :148] = np.clip(X[:, :148], -CLIP_ABS, CLIP_ABS)
         X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+        return X, valid_T
 
-        return X, valid_T, hand_motion
+    def assemble_windows(self, window_stride=8):
+        """Extract multiple non-resampled 64-frame windows from the rolling buffer.
+
+        Returns (windows, hand_motion) where windows is a list of (X, valid_T).
+        hand_motion is computed over the full buffer — used for idle detection.
+        Returns None if the buffer has fewer than t_target frames.
+        """
+        buf_list = list(self.buf)
+        n = len(buf_list)
+        T = self.t_target
+        if n < T:
+            return None
+
+        # Activity metric over full buffer
+        hand_xyz_full = np.stack([b[0] for b in buf_list], 0)
+        valid_full    = np.array([b[6] for b in buf_list], dtype=bool)
+        hand_valid    = hand_xyz_full[valid_full, 1:, :]  # wrist-relative joints only
+        hand_motion   = float(hand_valid.std(axis=0).mean()) if len(hand_valid) > 1 else 0.0
+
+        # Extract windows at every window_stride offset within the buffer
+        windows = []
+        for start in range(0, n - T + 1, window_stride):
+            X, valid_T = self._build_features_from_slice(buf_list[start:start + T])
+            windows.append((X, valid_T))
+
+        return windows, hand_motion
 
 
 # ------------------------------------------------------------------ MediaPipe Holistic
@@ -612,7 +609,7 @@ def main():
 
     # Processors
     hol_proc    = HolisticProcessor(draw=args.show_landmarks)
-    fb          = FeatureBufferXYZ(intr, t_target=args.t_target)
+    fb          = FeatureBufferXYZ(intr, t_target=args.t_target, buffer_size=args.buffer_size)
     accumulator = ProbAccumulator(
         n_classes        = art["n_classes"],
         alpha            = args.ema_alpha,
@@ -653,16 +650,15 @@ def main():
             if args.show_landmarks:
                 hol_proc.draw_landmarks(bgr, result)
 
-            # Assemble feature window
-            out = fb.assemble_window()
+            # Assemble multi-window feature set
+            out = fb.assemble_windows(args.window_stride)
             if out is None:
                 cv2.imshow("Online Recognizer XYZ", bgr)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
                 continue
-            X, valid_T, hand_motion = out
+            windows, hand_motion = out
 
-            vratio      = float(valid_T.mean())
             is_active   = hand_motion >= args.hand_motion_thresh
             public_label= accumulator.public_label
             ema_conf    = float(accumulator.ema.max())
@@ -676,23 +672,32 @@ def main():
             else:
                 idle_frames = 0
 
-            # ── Inference (only every inference_stride MediaPipe frames) ──
+            # ── Inference: run every inference_stride frames, vote across windows ──
             infer_idx += 1
-            if (is_active
-                    and vratio >= args.min_valid_ratio
-                    and infer_idx % args.inference_stride == 0):
-                Xi = X.copy()
-                if has_angles:
-                    Xi = _insert_angles(Xi)
-                if scale_mean is not None and scale_mean > 1e-8:
-                    Xi[:, 147] /= scale_mean
-                Xi[:, :n_continuous] = (Xi[:, :n_continuous] - mu) / (sd + 1e-8)
+            if is_active and infer_idx % args.inference_stride == 0:
+                window_probs = []
+                for X_w, valid_T_w in windows:
+                    vratio_w = float(valid_T_w.mean())
+                    if vratio_w < args.min_valid_ratio:
+                        continue
+                    Xi = X_w.copy()
+                    if has_angles:
+                        Xi = _insert_angles(Xi)
+                    if scale_mean is not None and scale_mean > 1e-8:
+                        Xi[:, 147] /= scale_mean
+                    Xi[:, :n_continuous] = (Xi[:, :n_continuous] - mu) / (sd + 1e-8)
+                    xt = torch.from_numpy(Xi[None]).float()
+                    mt = torch.from_numpy(valid_T_w[None].astype(np.float32))
+                    with torch.no_grad():
+                        p = torch.softmax(model(xt, mt), dim=1).cpu().numpy()[0]
+                    window_probs.append(p)
 
-                xt = torch.from_numpy(Xi[None]).float()
-                mt = torch.from_numpy(valid_T[None].astype(np.float32))
-                with torch.no_grad():
-                    probs = torch.softmax(model(xt, mt), dim=1).cpu().numpy()[0]
-                public_label, ema_conf = accumulator.update(probs)
+                if window_probs:
+                    # Average softmax across all windows then feed to EMA
+                    avg_probs = np.mean(window_probs, axis=0)
+                    public_label, ema_conf = accumulator.update(avg_probs)
+
+            vratio = float(np.mean([w[1].mean() for w in windows]))
 
             # ── HUD ──
             def label_name(idx):
