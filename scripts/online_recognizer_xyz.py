@@ -111,10 +111,20 @@ def parse_args():
                     help="Sequence length the model expects")
     ap.add_argument("--stride_frames", type=int, default=2,
                     help="Process every Nth frame to reduce CPU load (>=1)")
-    ap.add_argument("--smooth_k", type=int, default=3,
-                    help="Require K consecutive identical predictions to change public label")
-    ap.add_argument("--prob_tau", type=float, default=0.60,
-                    help="Min softmax probability for an immediate label change")
+    ap.add_argument("--ema_alpha", type=float, default=0.2,
+                    help="EMA update rate for probability accumulation (higher=faster response)")
+    ap.add_argument("--switch_margin", type=float, default=0.15,
+                    help="Hysteresis: new class must exceed current by this margin to switch")
+    ap.add_argument("--min_hold_frames", type=int, default=15,
+                    help="Frames to hold a prediction before allowing switch (~0.5s at 30fps)")
+    ap.add_argument("--inference_stride", type=int, default=12,
+                    help="Run model every N MediaPipe frames (~5 updates per 2s gesture)")
+    ap.add_argument("--confidence_thresh", type=float, default=0.45,
+                    help="Min EMA max-prob to emit any prediction (else show idle)")
+    ap.add_argument("--hand_motion_thresh", type=float, default=0.06,
+                    help="Min hand config std (bone-norm units) to consider user active")
+    ap.add_argument("--idle_reset_frames", type=int, default=20,
+                    help="Reset EMA after this many consecutive idle frames")
     ap.add_argument("--label_map", type=str, default=None,
                     help="Optional JSON mapping class index → name")
     ap.add_argument("--show_landmarks", action="store_true",
@@ -397,7 +407,11 @@ class FeatureBufferXYZ:
         ))
 
     def assemble_window(self):
-        """Build (T, 175) feature array matching landmark_with_xyz.py output exactly."""
+        """Build (T, 175) feature array matching landmark_with_xyz.py output exactly.
+
+        Also returns hand_motion: temporal std of wrist-relative hand joint positions
+        over valid frames (bone-normalized units). Low value = hand is stationary = idle.
+        """
         if len(self.buf) == 0:
             return None
 
@@ -408,6 +422,13 @@ class FeatureBufferXYZ:
         valid_joint_seq    = np.stack([b[4] for b in self.buf], 0)  # (t, 21)
         valid_arm_joint_seq= np.stack([b[5] for b in self.buf], 0)  # (t, 3)
         valid_seq          = np.array([b[6] for b in self.buf], dtype=bool)         # (t,)
+
+        # ── Activity metric: std of hand joint positions across valid frames ──
+        # joints [1:21] are wrist-relative & bone-normalized → captures all hand
+        # configuration changes (finger bending, spreading, orientation) without
+        # depending on whether the wrist itself translates.
+        hand_valid = hand_xyz_norm_seq[valid_seq, 1:, :]  # (n_valid, 20, 3)
+        hand_motion = float(hand_valid.std(axis=0).mean()) if len(hand_valid) > 1 else 0.0
 
         T = self.t_target
 
@@ -457,7 +478,7 @@ class FeatureBufferXYZ:
         X[:, :148] = np.clip(X[:, :148], -CLIP_ABS, CLIP_ABS)
         X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
 
-        return X, valid_T
+        return X, valid_T, hand_motion
 
 
 # ------------------------------------------------------------------ MediaPipe Holistic
@@ -505,27 +526,52 @@ class HolisticProcessor:
         self.holistic.close()
 
 
-# ------------------------------------------------------------------ Smoother
-class LabelSmoother:
-    def __init__(self, k_consecutive=3, prob_tau=0.60):
-        self.k = k_consecutive
-        self.tau = prob_tau
-        self.last_pred = None
-        self.streak = 0
-        self.public_label = None
+# ------------------------------------------------------------------ Prob accumulator
+class ProbAccumulator:
+    """Smooths predictions via EMA on softmax distributions with hysteresis + hold time.
 
-    def update(self, pred_idx, pred_prob=None):
-        if pred_idx == self.last_pred:
-            self.streak += 1
-        else:
-            self.last_pred = pred_idx
-            self.streak = 1
-        changed = False
-        if pred_prob is not None and pred_prob >= self.tau:
-            self.public_label = pred_idx; changed = True
-        elif self.streak >= self.k:
-            self.public_label = pred_idx; changed = True
-        return self.public_label, changed, self.streak
+    Replaces streak-based LabelSmoother. Each inference call updates an EMA of
+    the full probability vector. The public label only switches when:
+      1. The candidate has been ahead for at least min_hold_frames.
+      2. Its EMA probability exceeds the current label's by switch_margin.
+      3. The overall EMA confidence (max prob) exceeds confidence_thresh.
+    """
+
+    def __init__(self, n_classes, alpha=0.2, switch_margin=0.15,
+                 min_hold_frames=15, confidence_thresh=0.45):
+        self.n             = n_classes
+        self.alpha         = alpha
+        self.switch_margin = switch_margin
+        self.min_hold      = min_hold_frames
+        self.conf_thresh   = confidence_thresh
+        self.reset()
+
+    def reset(self):
+        self.ema          = np.ones(self.n, dtype=np.float32) / self.n
+        self.public_label = None
+        self.hold_count   = 0   # frames held on current public_label
+
+    def update(self, probs):
+        """Update EMA with new softmax vector. Returns (public_label, ema_max_prob)."""
+        self.ema = (1 - self.alpha) * self.ema + self.alpha * probs
+        candidate  = int(np.argmax(self.ema))
+        max_prob   = float(self.ema[candidate])
+        self.hold_count += 1
+
+        if max_prob < self.conf_thresh:
+            # Model is uncertain — stay silent
+            return None, max_prob
+
+        if self.public_label is None:
+            self.public_label = candidate
+            self.hold_count   = 0
+        elif (candidate != self.public_label
+              and self.hold_count >= self.min_hold
+              and self.ema[candidate] > self.ema[self.public_label] + self.switch_margin):
+            self.public_label = candidate
+            self.hold_count   = 0
+
+        return self.public_label, max_prob
 
 
 # ------------------------------------------------------------------ Main
@@ -565,12 +611,20 @@ def main():
           f"cx={intr.ppx:.2f} cy={intr.ppy:.2f} model={intr.model}")
 
     # Processors
-    hol_proc = HolisticProcessor(draw=args.show_landmarks)
-    fb       = FeatureBufferXYZ(intr, t_target=args.t_target)
-    smoother = LabelSmoother(k_consecutive=args.smooth_k, prob_tau=args.prob_tau)
+    hol_proc    = HolisticProcessor(draw=args.show_landmarks)
+    fb          = FeatureBufferXYZ(intr, t_target=args.t_target)
+    accumulator = ProbAccumulator(
+        n_classes        = art["n_classes"],
+        alpha            = args.ema_alpha,
+        switch_margin    = args.switch_margin,
+        min_hold_frames  = args.min_hold_frames,
+        confidence_thresh= args.confidence_thresh,
+    )
 
-    torch  = importlib.import_module("torch")
-    frame_idx = 0
+    torch       = importlib.import_module("torch")
+    frame_idx   = 0
+    infer_idx   = 0   # counts MediaPipe-processed frames for inference stride
+    idle_frames = 0   # consecutive frames below hand_motion_thresh
 
     try:
         while True:
@@ -606,52 +660,55 @@ def main():
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
                 continue
-            X, valid_T = out
+            X, valid_T, hand_motion = out
 
-            # Gate by valid ratio
-            vratio   = float(valid_T.mean())
-            pred_idx = None
-            pred_prob = None
+            vratio      = float(valid_T.mean())
+            is_active   = hand_motion >= args.hand_motion_thresh
+            public_label= accumulator.public_label
+            ema_conf    = float(accumulator.ema.max())
 
-            if vratio >= args.min_valid_ratio:
-                # Expand to 207-dim if model was trained with joint angles
+            # ── Idle tracking: reset accumulator after sustained stillness ──
+            if not is_active:
+                idle_frames += 1
+                if idle_frames >= args.idle_reset_frames:
+                    accumulator.reset()
+                    public_label = None
+            else:
+                idle_frames = 0
+
+            # ── Inference (only every inference_stride MediaPipe frames) ──
+            infer_idx += 1
+            if (is_active
+                    and vratio >= args.min_valid_ratio
+                    and infer_idx % args.inference_stride == 0):
+                Xi = X.copy()
                 if has_angles:
-                    X = _insert_angles(X)
-                # Apply per-fold scale normalization if trained with --normalize_scale_channel
+                    Xi = _insert_angles(Xi)
                 if scale_mean is not None and scale_mean > 1e-8:
-                    X[:, 147] /= scale_mean
-                # Standardize continuous channels only
-                X_std = X.copy()
-                X_std[:, :n_continuous] = (X[:, :n_continuous] - mu) / (sd + 1e-8)
+                    Xi[:, 147] /= scale_mean
+                Xi[:, :n_continuous] = (Xi[:, :n_continuous] - mu) / (sd + 1e-8)
 
-                xt = torch.from_numpy(X_std[None]).float()
+                xt = torch.from_numpy(Xi[None]).float()
                 mt = torch.from_numpy(valid_T[None].astype(np.float32))
                 with torch.no_grad():
-                    probs    = torch.softmax(model(xt, mt), dim=1).cpu().numpy()[0]
-                    pred_idx = int(np.argmax(probs))
-                    pred_prob= float(np.max(probs))
-
-            # Update smoother
-            if pred_idx is not None:
-                public_label, changed, streak = smoother.update(pred_idx, pred_prob)
-            else:
-                public_label, changed, streak = smoother.public_label, False, smoother.streak
+                    probs = torch.softmax(model(xt, mt), dim=1).cpu().numpy()[0]
+                public_label, ema_conf = accumulator.update(probs)
 
             # ── HUD ──
             def label_name(idx):
                 if idx is None: return "—"
                 return label_map.get(idx, str(idx)) if label_map else str(idx)
 
-            txt1 = f"valid={vratio:.2f}  pred={label_name(pred_idx)}"
-            txt2 = f"stable={label_name(public_label)}"
-            if pred_prob is not None:
-                txt1 += f"  p={pred_prob:.2f}"
+            state = "IDLE" if not is_active else f"motion={hand_motion:.3f}"
+            txt1  = f"valid={vratio:.2f}  {state}"
+            txt2  = f"gesture={label_name(public_label)}  conf={ema_conf:.2f}"
 
             cv2.rectangle(bgr, (0, 0), (bgr.shape[1], 62), (0, 0, 0), -1)
             cv2.putText(bgr, txt1, (10, 22), cv2.FONT_HERSHEY_SIMPLEX,
                         0.65, (0, 255, 255), 2, cv2.LINE_AA)
             cv2.putText(bgr, txt2, (10, 52), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.65, (0, 255, 0),   2, cv2.LINE_AA)
+                        0.65, (0, 255, 0) if public_label is not None else (128, 128, 128),
+                        2, cv2.LINE_AA)
 
             cv2.imshow("Online Recognizer XYZ", bgr)
             if cv2.waitKey(1) & 0xFF == ord("q"):
