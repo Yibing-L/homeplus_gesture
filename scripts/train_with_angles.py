@@ -830,6 +830,20 @@ def main():
             all_preds_with_pid.append(dict(pid=it["pid"], y=y_test[idx], p=p_test[idx]))
         plot_confusion_matrix(y_test, p_test, n_classes,
                               f"Confusion: {fold_name}", out_dir / f"cm_{fold_name}.png")
+        # Save per-fold model immediately
+        fold_artifact = dict(type="attention_bilstm_xyz_angles", in_dim=int(in_dim),
+                             n_continuous=N_CONTINUOUS, n_classes=n_classes,
+                             hidden=args.hidden, lstm_layers=args.lstm_layers,
+                             attn_heads=args.attn_heads, proj_dim=args.proj_dim, dropout=args.dropout,
+                             mu=mu.squeeze().astype(np.float32),
+                             sd=sd.squeeze().astype(np.float32),
+                             scale_mean=float(scale_mean) if scale_mean is not None else None,
+                             state_dict=best_state,
+                             fold=fold_name, val_f1=float(best_val_f1),
+                             test_f1=float(tf1), test_acc=float(tacc))
+        torch.save(fold_artifact, out_dir / f"model_{n_classes}_{fold_name}.pt")
+        log.info(f"Saved model_{n_classes}_{fold_name}.pt  (test F1={tf1:.3f})")
+
         if tf1 > best_global_f1:
             best_global_f1 = tf1
             best_global_val_f1 = float(best_val_f1)
