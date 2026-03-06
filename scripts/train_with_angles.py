@@ -152,18 +152,18 @@ def parse_args():
     ap.add_argument("--eval_mode", type=str, default="loso", choices=["loso", "kfold"])
     ap.add_argument("--k", type=int, default=5)
 
-    ap.add_argument("--hidden", type=int, default=128)
+    ap.add_argument("--hidden", type=int, default=256)
     ap.add_argument("--lstm_layers", type=int, default=2)
     ap.add_argument("--attn_heads", type=int, default=4)
-    ap.add_argument("--proj_dim", type=int, default=128)
+    ap.add_argument("--proj_dim", type=int, default=256)
     ap.add_argument("--dropout", type=float, default=0.4)
 
-    ap.add_argument("--epochs", type=int, default=80)
+    ap.add_argument("--epochs", type=int, default=120)
     ap.add_argument("--batch_size", type=int, default=64)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--weight_decay", type=float, default=5e-4)
     ap.add_argument("--label_smoothing", type=float, default=0.1)
-    ap.add_argument("--patience", type=int, default=20)
+    ap.add_argument("--patience", type=int, default=30)
     ap.add_argument("--clip_grad", type=float, default=1.0)
 
     ap.add_argument("--no_aug", action="store_true")
@@ -174,6 +174,14 @@ def parse_args():
     ap.add_argument("--aug_block_mask_prob", type=float, default=0.05)
     ap.add_argument("--aug_scale_jitter", action="store_true", default=True)
     ap.add_argument("--no_aug_scale_jitter", action="store_true")
+    ap.add_argument("--aug_rotate_prob", type=float, default=0.5,
+                    help="Probability of applying in-plane pose rotation per sample")
+    ap.add_argument("--aug_rotate_max_deg", type=float, default=15.0,
+                    help="Max rotation angle in degrees for rotate_pose augmentation")
+    ap.add_argument("--aug_temporal_crop_prob", type=float, default=0.5,
+                    help="Probability of applying random temporal crop per sample")
+    ap.add_argument("--mixup_alpha", type=float, default=0.2,
+                    help="Beta distribution alpha for Mixup (0 = disabled)")
 
     ap.add_argument("--clip_norm", action="store_true", default=True)
     ap.add_argument("--no_clip_norm", action="store_true")
@@ -343,6 +351,58 @@ def scale_jitter(X, lo=0.8, hi=1.2):
     return X_out
 
 
+def rotate_pose(X, max_angle_deg=15.0):
+    """Rotate hand/arm pose in the XY plane by a random angle.
+
+    Simulates natural variation in hand orientation across subjects/sessions.
+    Applied to pose [0:72], vel_pose [72:144], and vel_wrist [144:147].
+    Bend angles [148:164] are rotation-invariant — not touched.
+    Binary validity channels are not touched.
+
+    Args:
+        X: (T, 207) feature array (post-standardization or pre).
+        max_angle_deg: maximum rotation magnitude in degrees.
+    """
+    theta = np.random.uniform(-max_angle_deg, max_angle_deg) * (np.pi / 180.0)
+    c, s = np.cos(theta), np.sin(theta)
+    X_out = X.copy()
+    # Rotate every (x, y, z) triplet in pose and vel_pose blocks
+    for block_start, block_end in [(0, 72), (72, 144)]:
+        x_idx = np.arange(block_start, block_end, 3)
+        y_idx = x_idx + 1
+        x = X_out[:, x_idx].copy()
+        y = X_out[:, y_idx].copy()
+        X_out[:, x_idx] = c * x - s * y
+        X_out[:, y_idx] = s * x + c * y
+    # vel_wrist (144:147) is a single (vx, vy, vz)
+    vx = X_out[:, 144].copy()
+    vy = X_out[:, 145].copy()
+    X_out[:, 144] = c * vx - s * vy
+    X_out[:, 145] = s * vx + c * vy
+    return X_out
+
+
+def temporal_crop(X, valid, min_frac=0.7):
+    """Take a random contiguous temporal crop and resample back to original T.
+
+    Distinct from speed_perturb: the crop window is random (not center-anchored)
+    and always resamples to the original sequence length.
+    """
+    T = X.shape[0]
+    crop_len = max(4, int(T * np.random.uniform(min_frac, 1.0)))
+    start = np.random.randint(0, max(1, T - crop_len + 1))
+    X_crop = X[start:start + crop_len]
+    v_crop = valid[start:start + crop_len].astype(np.float32)
+    idx = np.linspace(0, crop_len - 1, T)
+    lo_i = np.floor(idx).astype(int)
+    hi_i = np.clip(lo_i + 1, 0, crop_len - 1)
+    w = (idx - lo_i)[:, None]
+    X_out = ((1 - w) * X_crop[lo_i] + w * X_crop[hi_i]).astype(np.float32)
+    v_out = np.interp(np.linspace(0, crop_len - 1, T),
+                      np.arange(crop_len), v_crop) > 0.5
+    return X_out, v_out
+
+
 # ================================================================
 # Dataset
 # ================================================================
@@ -367,6 +427,8 @@ class AugmentedClipSet(Dataset):
                 X, valid = speed_perturb(X, valid)
             if self.cfg.get("warp", True) and np.random.rand() < 0.5:
                 X, valid = time_warp(X, valid)
+            if self.cfg.get("temporal_crop_prob", 0.0) > 0 and np.random.rand() < self.cfg.get("temporal_crop_prob", 0.0):
+                X, valid = temporal_crop(X, valid)
             if self.cfg.get("noise_std", 0.02) > 0:
                 X = gaussian_noise(X, self.cfg.get("noise_std", 0.02))
             if self.cfg.get("frame_drop_prob", 0.05) > 0:
@@ -375,6 +437,8 @@ class AugmentedClipSet(Dataset):
                 X = feature_block_mask(X, self.cfg.get("block_mask_prob", 0.05))
             if self.cfg.get("scale_jitter", True):
                 X = scale_jitter(X)
+            if self.cfg.get("rotate_prob", 0.0) > 0 and np.random.rand() < self.cfg.get("rotate_prob", 0.0):
+                X = rotate_pose(X, self.cfg.get("rotate_max_deg", 15.0))
 
         if self.clip_norm:
             mu = X[:, :N_CONTINUOUS].mean(axis=0)
@@ -496,12 +560,20 @@ def derive_head_7_from_42(state_dict):
 # ================================================================
 # Training & Evaluation
 # ================================================================
-def train_epoch(model, loader, optimizer, scheduler, criterion, device, clip_grad):
+def train_epoch(model, loader, optimizer, scheduler, criterion, device, clip_grad, mixup_alpha=0.0):
     model.train()
     total_loss = 0.0; n_samples = 0
     for X, M, y in loader:
         X, M, y = X.to(device), M.to(device), y.to(device)
-        loss = criterion(model(X, M), y)
+        if mixup_alpha > 0 and np.random.rand() < 0.5:
+            lam = float(np.random.beta(mixup_alpha, mixup_alpha))
+            idx = torch.randperm(X.size(0), device=device)
+            X_mix = lam * X + (1 - lam) * X[idx]
+            M_mix = lam * M + (1 - lam) * M[idx]
+            logits = model(X_mix, M_mix)
+            loss = lam * criterion(logits, y) + (1 - lam) * criterion(logits, y[idx])
+        else:
+            loss = criterion(model(X, M), y)
         optimizer.zero_grad(); loss.backward()
         if clip_grad > 0:
             clip_grad_norm_(model.parameters(), clip_grad)
@@ -615,7 +687,11 @@ def main():
         speed=args.aug_speed, warp=args.aug_warp,
         noise_std=args.aug_noise_std, frame_drop_prob=args.aug_frame_drop_prob,
         block_mask_prob=args.aug_block_mask_prob, scale_jitter=args.aug_scale_jitter,
+        rotate_prob=args.aug_rotate_prob,
+        rotate_max_deg=args.aug_rotate_max_deg,
+        temporal_crop_prob=args.aug_temporal_crop_prob,
     )
+    mixup_alpha = 0.0 if args.no_aug else args.mixup_alpha
 
     splits = list(generate_loso_splits(items) if args.eval_mode == "loso"
                   else generate_kfold_splits(items, args.k, args.seed))
@@ -666,7 +742,7 @@ def main():
         for ep in range(1, args.epochs + 1):
             t0 = time.time()
             tr_loss = train_epoch(model, dl_train, optimizer, scheduler,
-                                  criterion, device, args.clip_grad)
+                                  criterion, device, args.clip_grad, mixup_alpha)
             y_val, p_val = evaluate(model, dl_val, device)
             vf1 = macro_f1(y_val, p_val, n_classes)
             vacc = accuracy_score(y_val, p_val)
