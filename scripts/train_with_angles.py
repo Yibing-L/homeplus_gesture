@@ -838,6 +838,7 @@ def main():
                              mu=mu.squeeze().astype(np.float32),
                              sd=sd.squeeze().astype(np.float32),
                              scale_mean=float(scale_mean) if scale_mean is not None else None,
+                             clip_norm=args.clip_norm,
                              state_dict=best_state,
                              fold=fold_name, val_f1=float(best_val_f1),
                              test_f1=float(tf1), test_acc=float(tacc))
@@ -897,6 +898,7 @@ def main():
                     mu=best_global_mu.squeeze().astype(np.float32),
                     sd=best_global_sd.squeeze().astype(np.float32),
                     scale_mean=float(best_global_scale_mean) if best_global_scale_mean is not None else None,
+                    clip_norm=args.clip_norm,
                     state_dict=best_global_state,
                     # provenance / eval metadata
                     roots=[str(r) for r in args.roots],

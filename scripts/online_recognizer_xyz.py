@@ -296,6 +296,9 @@ def load_checkpoint(path):
         "has_angles":   has_angles,
         # scale_mean is stored when --normalize_scale_channel was used at training
         "scale_mean":   float(art["scale_mean"]) if art.get("scale_mean") is not None else None,
+        # clip_norm: per-sample instance normalization applied after global z-score during training.
+        # Default True to match train_with_angles.py default.
+        "clip_norm":    bool(art.get("clip_norm", True)),
     }
 
 
@@ -589,9 +592,10 @@ def main():
     n_continuous = art["n_continuous"]
     has_angles   = art["has_angles"]
     scale_mean   = art["scale_mean"]
+    clip_norm    = art["clip_norm"]
     print(f"[INFO] Loaded model: {art['n_classes']}-class, in_dim={art['in_dim']}, "
           f"n_continuous={n_continuous}, angles={has_angles}, "
-          f"scale_mean={scale_mean}")
+          f"scale_mean={scale_mean}, clip_norm={clip_norm}")
 
     # RealSense setup
     pipeline = rs.pipeline()
@@ -689,6 +693,11 @@ def main():
                     if scale_mean is not None and scale_mean > 1e-8:
                         Xi[:, 147] /= scale_mean
                     Xi[:, :n_continuous] = (Xi[:, :n_continuous] - mu) / (sd + 1e-8)
+                    if clip_norm:
+                        # Per-sample instance normalization — mirrors AugmentedClipSet.__getitem__
+                        c_mu = Xi[:, :n_continuous].mean(axis=0)
+                        c_sd = Xi[:, :n_continuous].std(axis=0) + 1e-6
+                        Xi[:, :n_continuous] = (Xi[:, :n_continuous] - c_mu) / c_sd
                     xt = torch.from_numpy(Xi[None]).float()
                     mt = torch.from_numpy(valid_T_w[None].astype(np.float32))
                     with torch.no_grad():
