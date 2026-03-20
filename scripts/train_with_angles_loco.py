@@ -218,6 +218,10 @@ def parse_args():
 
     ap.add_argument("--clip_norm", action="store_true", default=True)
     ap.add_argument("--no_clip_norm", action="store_true")
+    ap.add_argument("--range_norm", action="store_true", default=False,
+                    help="Per-clip min-max normalization of continuous channels to [0,1]. "
+                         "Makes model see trajectory shape, not absolute scale. "
+                         "Applied before clip_norm.")
 
     ap.add_argument("--seed", type=int, default=1337)
     ap.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
@@ -536,11 +540,12 @@ def temporal_crop(X, valid, min_frac=0.7):
 # Dataset
 # ================================================================
 class AugmentedClipSet(Dataset):
-    def __init__(self, items, augment=False, aug_cfg=None, clip_norm=False):
+    def __init__(self, items, augment=False, aug_cfg=None, clip_norm=False, range_norm=False):
         self.items = items
         self.augment = augment
         self.cfg = aug_cfg or {}
         self.clip_norm = clip_norm
+        self.range_norm = range_norm
 
     def __len__(self):
         return len(self.items)
@@ -569,6 +574,16 @@ class AugmentedClipSet(Dataset):
                                     hi=self.cfg.get("scale_hi", 1.2))
             if self.cfg.get("rotate_prob", 0.0) > 0 and np.random.rand() < self.cfg.get("rotate_prob", 0.0):
                 X = rotate_pose(X, self.cfg.get("rotate_max_deg", 15.0))
+
+        if self.range_norm:
+            # Normalize each continuous channel to [0, 1] within this clip
+            # Makes model see trajectory *shape* not *scale*
+            c = X[:, :N_CONTINUOUS]
+            cmin = c.min(axis=0, keepdims=True)
+            cmax = c.max(axis=0, keepdims=True)
+            rng = cmax - cmin
+            rng[rng < 1e-8] = 1.0  # constant channels stay at 0
+            X[:, :N_CONTINUOUS] = (c - cmin) / rng
 
         if self.clip_norm:
             mu = X[:, :N_CONTINUOUS].mean(axis=0)
@@ -1077,9 +1092,12 @@ def main():
         test_std  = standardize_apply(test_items,  mu, sd, scale_mean)
 
         ds_train = AugmentedClipSet(train_std, augment=(aug_cfg is not None),
-                                    aug_cfg=aug_cfg, clip_norm=args.clip_norm)
-        ds_val   = AugmentedClipSet(val_std,   augment=False, clip_norm=args.clip_norm)
-        ds_test  = AugmentedClipSet(test_std,  augment=False, clip_norm=args.clip_norm)
+                                    aug_cfg=aug_cfg, clip_norm=args.clip_norm,
+                                    range_norm=args.range_norm)
+        ds_val   = AugmentedClipSet(val_std,   augment=False, clip_norm=args.clip_norm,
+                                    range_norm=args.range_norm)
+        ds_test  = AugmentedClipSet(test_std,  augment=False, clip_norm=args.clip_norm,
+                                    range_norm=args.range_norm)
 
         dl_train = DataLoader(ds_train, args.batch_size, shuffle=True,
                               collate_fn=collate, num_workers=args.num_workers)
