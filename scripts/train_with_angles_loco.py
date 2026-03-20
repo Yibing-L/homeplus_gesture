@@ -535,8 +535,11 @@ class SupConLoss(nn.Module):
         if B <= 1:
             return torch.tensor(0.0, device=features.device)
 
+        # Compute in float32 for stability
+        features = features.float()
+
         # (B, B) cosine similarity (features already L2-normed)
-        sim = (features @ features.T).clamp(-1, 1) / self.temperature
+        sim = (features @ features.T) / self.temperature
 
         # Mask: same label = positive, diagonal = excluded
         labels = labels.unsqueeze(1)
@@ -549,15 +552,12 @@ class SupConLoss(nn.Module):
         if not valid.any():
             return torch.tensor(0.0, device=features.device)
 
-        # Stability: subtract max per row
-        logits_max, _ = sim.detach().max(dim=1, keepdim=True)
-        sim = sim - logits_max
-
-        # Exclude self-similarity
+        # Exclude self-similarity — set diagonal to large negative before softmax
+        large_neg = -1e4
         self_mask = torch.eye(B, device=features.device, dtype=torch.bool)
-        sim.masked_fill_(self_mask, float("-inf"))
+        sim = sim.masked_fill(self_mask, large_neg)
 
-        # Log-softmax over negatives + positives (all non-self)
+        # Log-softmax over all non-self entries
         log_prob = sim - torch.logsumexp(sim, dim=1, keepdim=True)
 
         # Mean of log-prob over positives for each valid anchor
@@ -627,7 +627,8 @@ class AttentionBiLSTM(nn.Module):
         if contrastive_dim > 0:
             self.contrast_proj = nn.Sequential(
                 nn.Linear(proj_dim, proj_dim),
-                nn.ReLU(),
+                nn.LayerNorm(proj_dim),
+                nn.GELU(),
                 nn.Linear(proj_dim, contrastive_dim),
             )
         else:
@@ -745,6 +746,7 @@ def train_epoch(model, loader, optimizer, scheduler, criterion, device, clip_gra
     use_supcon = supcon_loss_fn is not None and contrastive_weight > 0
     for X, M, y in loader:
         X, M, y = X.to(device), M.to(device), y.to(device)
+        optimizer.zero_grad()
         if mixup_alpha > 0 and np.random.rand() < 0.5:
             # Mixup path: skip SupCon (mixed labels aren't clean positives)
             lam = float(np.random.beta(mixup_alpha, mixup_alpha))
@@ -762,10 +764,10 @@ def train_epoch(model, loader, optimizer, scheduler, criterion, device, clip_gra
             loss = criterion(model(X, M), y)
         if not torch.isfinite(loss):
             n_skipped += 1
-            optimizer.zero_grad()
+            # Still step scheduler to keep LR schedule aligned with epoch count
             scheduler.step()
             continue
-        optimizer.zero_grad(); loss.backward()
+        loss.backward()
         if clip_grad > 0:
             clip_grad_norm_(model.parameters(), clip_grad)
         optimizer.step(); scheduler.step()
