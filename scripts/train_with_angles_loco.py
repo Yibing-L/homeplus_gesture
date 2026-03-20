@@ -154,12 +154,25 @@ def parse_args():
 
     ap.add_argument("--eval_mode", type=str, default="loco", choices=["loco", "loso", "kfold"])
     ap.add_argument("--k", type=int, default=5)
+    ap.add_argument("--loco_subject_val", action="store_true", default=False,
+                    help="In LOCO mode, hold out one subject from training conditions for val "
+                         "instead of using a held-out condition. Prevents subject leakage between "
+                         "train and val splits.")
 
     ap.add_argument("--hidden", type=int, default=256)
     ap.add_argument("--lstm_layers", type=int, default=2)
     ap.add_argument("--attn_heads", type=int, default=4)
     ap.add_argument("--proj_dim", type=int, default=256)
     ap.add_argument("--dropout", type=float, default=0.4)
+
+    ap.add_argument("--block_proj_dim", type=int, default=0,
+                    help="Per-block input projection dim (0 = disabled, use original single linear)")
+    ap.add_argument("--contrastive_weight", type=float, default=0.0,
+                    help="Weight for supervised contrastive loss (0 = disabled)")
+    ap.add_argument("--contrastive_dim", type=int, default=128,
+                    help="Contrastive projection head output dim")
+    ap.add_argument("--contrastive_temp", type=float, default=0.07,
+                    help="Temperature for SupCon InfoNCE loss")
 
     ap.add_argument("--epochs", type=int, default=120)
     ap.add_argument("--batch_size", type=int, default=64)
@@ -491,7 +504,69 @@ def collate(batch):
 
 
 # ================================================================
-# Model: Attention-BiLSTM (unchanged from train_xyz.py)
+# Feature block boundaries for per-block projection
+# ================================================================
+FEATURE_BLOCKS = [
+    (0, 72),      # pose XYZ
+    (72, 144),    # vel_pose XYZ
+    (144, 147),   # vel_wrist
+    (147, 148),   # scale
+    (148, 164),   # joint angles
+    (164, 207),   # validity flags
+]
+
+
+# ================================================================
+# Supervised Contrastive Loss (Khosla et al. 2020)
+# ================================================================
+class SupConLoss(nn.Module):
+    def __init__(self, temperature=0.07):
+        super().__init__()
+        self.temperature = temperature
+
+    def forward(self, features, labels):
+        """
+        Args:
+            features: (B, D) L2-normalized embeddings.
+            labels:   (B,) integer class labels.
+        """
+        B = features.size(0)
+        if B <= 1:
+            return torch.tensor(0.0, device=features.device)
+
+        # (B, B) cosine similarity (features already L2-normed)
+        sim = features @ features.T / self.temperature
+
+        # Mask: same label = positive, diagonal = excluded
+        labels = labels.unsqueeze(1)
+        pos_mask = (labels == labels.T).float()
+        pos_mask.fill_diagonal_(0.0)
+
+        # If any anchor has zero positives, skip it
+        n_pos = pos_mask.sum(dim=1)
+        valid = n_pos > 0
+        if not valid.any():
+            return torch.tensor(0.0, device=features.device)
+
+        # Stability: subtract max per row
+        logits_max, _ = sim.detach().max(dim=1, keepdim=True)
+        sim = sim - logits_max
+
+        # Exclude self-similarity
+        self_mask = torch.eye(B, device=features.device, dtype=torch.bool)
+        sim.masked_fill_(self_mask, float("-inf"))
+
+        # Log-softmax over negatives + positives (all non-self)
+        log_prob = sim - torch.logsumexp(sim, dim=1, keepdim=True)
+
+        # Mean of log-prob over positives for each valid anchor
+        mean_log_prob = (pos_mask * log_prob).sum(dim=1) / n_pos.clamp(min=1)
+        loss = -mean_log_prob[valid].mean()
+        return loss
+
+
+# ================================================================
+# Model: Attention-BiLSTM
 # ================================================================
 class TemporalAttentionPool(nn.Module):
     def __init__(self, embed_dim, num_heads=4):
@@ -508,12 +583,32 @@ class TemporalAttentionPool(nn.Module):
 
 class AttentionBiLSTM(nn.Module):
     def __init__(self, in_dim, n_classes, hidden=128, lstm_layers=2,
-                 attn_heads=4, proj_dim=128, dropout=0.4):
+                 attn_heads=4, proj_dim=128, dropout=0.4,
+                 block_proj_dim=0, contrastive_dim=0):
         super().__init__()
         self.proj_dim = proj_dim
-        self.input_proj = nn.Sequential(
-            nn.Linear(in_dim, proj_dim), nn.LayerNorm(proj_dim), nn.GELU(),
-        )
+        self.block_proj_dim = block_proj_dim
+
+        # Input projection: per-block or single linear
+        if block_proj_dim > 0:
+            self.block_projs = nn.ModuleList([
+                nn.Sequential(
+                    nn.Linear(end - start, block_proj_dim),
+                    nn.LayerNorm(block_proj_dim),
+                    nn.GELU(),
+                )
+                for start, end in FEATURE_BLOCKS
+            ])
+            concat_dim = block_proj_dim * len(FEATURE_BLOCKS)
+            self.input_proj = nn.Sequential(
+                nn.Linear(concat_dim, proj_dim), nn.LayerNorm(proj_dim), nn.GELU(),
+            )
+        else:
+            self.block_projs = None
+            self.input_proj = nn.Sequential(
+                nn.Linear(in_dim, proj_dim), nn.LayerNorm(proj_dim), nn.GELU(),
+            )
+
         self.lstm = nn.LSTM(
             proj_dim, hidden, lstm_layers,
             dropout=dropout if lstm_layers > 1 else 0.0,
@@ -527,8 +622,26 @@ class AttentionBiLSTM(nn.Module):
             nn.LayerNorm(proj_dim), nn.Dropout(dropout), nn.Linear(proj_dim, n_classes),
         )
 
-    def forward(self, x, mask):
-        h_proj = self.input_proj(x)
+        # Contrastive projection head (training-only, not saved in artifacts)
+        if contrastive_dim > 0:
+            self.contrast_proj = nn.Sequential(
+                nn.Linear(proj_dim, proj_dim),
+                nn.ReLU(),
+                nn.Linear(proj_dim, contrastive_dim),
+            )
+        else:
+            self.contrast_proj = None
+
+    def _encode(self, x, mask):
+        """Shared backbone: input_proj → LSTM → residual → attn_pool → pooled."""
+        if self.block_projs is not None:
+            blocks = [proj(x[:, :, s:e]) for proj, (s, e) in
+                      zip(self.block_projs, FEATURE_BLOCKS)]
+            h_in = torch.cat(blocks, dim=-1)
+            h_proj = self.input_proj(h_in)
+        else:
+            h_proj = self.input_proj(x)
+
         lengths = mask.sum(dim=1).clamp(min=1).to(torch.int64)
         packed = nn.utils.rnn.pack_padded_sequence(
             h_proj, lengths.cpu(), batch_first=True, enforce_sorted=False)
@@ -541,7 +654,19 @@ class AttentionBiLSTM(nn.Module):
             lstm_out = torch.cat([lstm_out, pad], dim=1)
         h = self.res_norm(self.res_proj(lstm_out) + h_proj)
         pooled = self.attn_pool(h, key_padding_mask=~(mask[:, :T_proj].bool()))
-        return self.head(pooled)
+        return pooled
+
+    def forward(self, x, mask):
+        """Returns logits only (used by evaluate and inference)."""
+        return self.head(self._encode(x, mask))
+
+    def forward_with_contrast(self, x, mask):
+        """Returns (logits, L2-normed contrastive embeddings)."""
+        pooled = self._encode(x, mask)
+        logits = self.head(pooled)
+        z = self.contrast_proj(pooled)
+        z = nn.functional.normalize(z, dim=-1)
+        return logits, z
 
 
 # ================================================================
@@ -610,18 +735,26 @@ def derive_head_7_from_42(state_dict):
 # ================================================================
 # Training & Evaluation
 # ================================================================
-def train_epoch(model, loader, optimizer, scheduler, criterion, device, clip_grad, mixup_alpha=0.0):
+def train_epoch(model, loader, optimizer, scheduler, criterion, device, clip_grad,
+                mixup_alpha=0.0, supcon_loss_fn=None, contrastive_weight=0.0):
     model.train()
     total_loss = 0.0; n_samples = 0; n_skipped = 0
+    use_supcon = supcon_loss_fn is not None and contrastive_weight > 0
     for X, M, y in loader:
         X, M, y = X.to(device), M.to(device), y.to(device)
         if mixup_alpha > 0 and np.random.rand() < 0.5:
+            # Mixup path: skip SupCon (mixed labels aren't clean positives)
             lam = float(np.random.beta(mixup_alpha, mixup_alpha))
             idx = torch.randperm(X.size(0), device=device)
             X_mix = lam * X + (1 - lam) * X[idx]
             M_mix = lam * M + (1 - lam) * M[idx]
             logits = model(X_mix, M_mix)
             loss = lam * criterion(logits, y) + (1 - lam) * criterion(logits, y[idx])
+        elif use_supcon:
+            logits, z = model.forward_with_contrast(X, M)
+            ce_loss = criterion(logits, y)
+            con_loss = supcon_loss_fn(z, y)
+            loss = ce_loss + contrastive_weight * con_loss
         else:
             loss = criterion(model(X, M), y)
         if not torch.isfinite(loss):
@@ -680,17 +813,33 @@ def plot_training_curves(history, save_path):
 # ================================================================
 # LOCO / LOSO / K-fold splits
 # ================================================================
-def generate_loco_splits(items):
-    """Leave-One-Condition-Out: hold out one condition for test, next for val."""
+def generate_loco_splits(items, subject_val=False):
+    """Leave-One-Condition-Out.
+
+    Args:
+        items: list of clip dicts with 'cond' and 'pid' keys.
+        subject_val: if True, val set is one subject held out from the
+            *training* conditions (no condition held out for val).  This
+            prevents subject leakage between train and val while keeping
+            all non-test conditions available for training.
+            If False (default), a second condition is held out for val.
+    """
     conds = sorted(set(it["cond"] for it in items))
+    pids  = sorted(set(it["pid"] for it in items), key=lambda x: int(x))
     for i, test_cond in enumerate(conds):
-        val_cond = conds[(i + 1) % len(conds)]
-        yield (
-            [it for it in items if it["cond"] != test_cond and it["cond"] != val_cond],
-            [it for it in items if it["cond"] == val_cond],
-            [it for it in items if it["cond"] == test_cond],
-            f"LOCO-cond{test_cond}",
-        )
+        test  = [it for it in items if it["cond"] == test_cond]
+        rest  = [it for it in items if it["cond"] != test_cond]
+        if subject_val:
+            # Hold out one subject from training conditions for val
+            val_pid = pids[i % len(pids)]
+            train = [it for it in rest if it["pid"] != val_pid]
+            val   = [it for it in rest if it["pid"] == val_pid]
+        else:
+            # Hold out next condition for val
+            val_cond = conds[(i + 1) % len(conds)]
+            train = [it for it in rest if it["cond"] != val_cond]
+            val   = [it for it in rest if it["cond"] == val_cond]
+        yield (train, val, test, f"LOCO-cond{test_cond}")
 
 
 def generate_loso_splits(items):
@@ -769,7 +918,10 @@ def main():
     mixup_alpha = 0.0 if args.no_aug else args.mixup_alpha
 
     if args.eval_mode == "loco":
-        splits = list(generate_loco_splits(items))
+        splits = list(generate_loco_splits(items, subject_val=args.loco_subject_val))
+        # Sort splits so 4th constraint (idx 3) and 6th constraint (idx 5) are first
+        priority_conds = {"LOCO-cond3", "LOCO-cond5"}
+        splits.sort(key=lambda s: (0 if s[3] in priority_conds else 1))
     elif args.eval_mode == "loso":
         splits = list(generate_loso_splits(items))
     else:
@@ -807,13 +959,18 @@ def main():
 
         model = AttentionBiLSTM(in_dim, n_classes, hidden=args.hidden,
                                 lstm_layers=args.lstm_layers, attn_heads=args.attn_heads,
-                                proj_dim=args.proj_dim, dropout=args.dropout).to(device)
+                                proj_dim=args.proj_dim, dropout=args.dropout,
+                                block_proj_dim=args.block_proj_dim,
+                                contrastive_dim=args.contrastive_dim if args.contrastive_weight > 0 else 0,
+                                ).to(device)
         optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr,
                                       weight_decay=args.weight_decay)
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optimizer, max_lr=args.lr, total_steps=args.epochs * len(dl_train),
             pct_start=0.1, anneal_strategy="cos")
         criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
+        supcon_loss_fn = SupConLoss(temperature=args.contrastive_temp).to(device) \
+            if args.contrastive_weight > 0 else None
 
         best_state, best_val_f1, no_improve = None, -1.0, 0
         history = {"train_loss": [], "val_f1": [], "val_acc": []}
@@ -821,7 +978,8 @@ def main():
         for ep in range(1, args.epochs + 1):
             t0 = time.time()
             tr_loss = train_epoch(model, dl_train, optimizer, scheduler,
-                                  criterion, device, args.clip_grad, mixup_alpha)
+                                  criterion, device, args.clip_grad, mixup_alpha,
+                                  supcon_loss_fn, args.contrastive_weight)
             y_val, p_val = evaluate(model, dl_val, device)
             vf1 = macro_f1(y_val, p_val, n_classes)
             vacc = accuracy_score(y_val, p_val)
@@ -832,7 +990,9 @@ def main():
                      f"F1={vf1:.3f}  Acc={vacc:.3f}  ({time.time()-t0:.1f}s)")
             if vf1 > best_val_f1:
                 best_val_f1 = vf1
-                best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+                # Exclude contrastive projection head from saved state (training-only)
+                best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()
+                              if not k.startswith("contrast_proj.")}
                 no_improve = 0
             else:
                 no_improve += 1
@@ -841,7 +1001,7 @@ def main():
                     break
 
         plot_training_curves(history, out_dir / f"curves_{fold_name}.png")
-        model.load_state_dict(best_state)
+        model.load_state_dict(best_state, strict=False)
         y_test, p_test = evaluate(model, dl_test, device)
         tf1  = macro_f1(y_test, p_test, n_classes)
         tacc = accuracy_score(y_test, p_test)
@@ -863,6 +1023,7 @@ def main():
                              n_continuous=N_CONTINUOUS, n_classes=n_classes,
                              hidden=args.hidden, lstm_layers=args.lstm_layers,
                              attn_heads=args.attn_heads, proj_dim=args.proj_dim, dropout=args.dropout,
+                             block_proj_dim=args.block_proj_dim,
                              mu=mu.squeeze().astype(np.float32),
                              sd=sd.squeeze().astype(np.float32),
                              scale_mean=float(scale_mean) if scale_mean is not None else None,
@@ -927,6 +1088,7 @@ def main():
                     n_continuous=N_CONTINUOUS, n_classes=n_classes,
                     hidden=args.hidden, lstm_layers=args.lstm_layers,
                     attn_heads=args.attn_heads, proj_dim=args.proj_dim, dropout=args.dropout,
+                    block_proj_dim=args.block_proj_dim,
                     mu=best_global_mu.squeeze().astype(np.float32),
                     sd=best_global_sd.squeeze().astype(np.float32),
                     scale_mean=float(best_global_scale_mean) if best_global_scale_mean is not None else None,
