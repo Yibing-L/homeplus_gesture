@@ -160,6 +160,14 @@ def parse_args():
                          "training — no subject or condition leakage anywhere.")
     ap.add_argument("--k", type=int, default=5)
 
+    ap.add_argument("--loco_features", action="store_true", default=False,
+                    help="Use only condition-invariant features: hand XYZ (63), "
+                         "hand velocity (63), wrist velocity (3), 15 hand angles, "
+                         "hand angle velocities (15, computed), frame validity, "
+                         "hand joint validity (21), hand coverage. "
+                         "Drops: arm XYZ, arm velocity, scale, elbow angle, "
+                         "arm validity, arm coverage, arm angle validity.")
+
     ap.add_argument("--hidden", type=int, default=256)
     ap.add_argument("--lstm_layers", type=int, default=2)
     ap.add_argument("--attn_heads", type=int, default=4)
@@ -300,6 +308,79 @@ def load_items(roots):
     print(f"Loaded {len(items)} clips from {len(set(it['pid'] for it in items))} participants, "
           f"{len(conds)} conditions {conds}.")
     return items
+
+
+# ================================================================
+# LOCO feature selection — condition-invariant channels only
+# ================================================================
+# New layout after filtering (197 channels):
+#   [0:63]    hand XYZ (21j×3)
+#   [63:126]  hand vel XYZ (21j×3)
+#   [126:129] wrist velocity (3)
+#   [129:144] hand angles (15)
+#   [144:159] hand angle velocities (15, frame-to-frame diff)
+#   -- N_CONTINUOUS_LOCO = 159 --
+#   [159:160] frame_valid
+#   [160:181] hand joint validity (21)
+#   [181:182] hand coverage
+#   [182:197] hand angle validity (15)
+N_CONTINUOUS_LOCO = 159
+
+FEATURE_BLOCKS_LOCO = [
+    (0, 63),      # hand XYZ
+    (63, 126),    # hand vel XYZ
+    (126, 129),   # vel_wrist
+    (129, 144),   # hand angles
+    (144, 159),   # hand angle velocities
+    (159, 197),   # validity flags
+]
+
+
+def select_loco_features(items):
+    """Filter 207-dim features to condition-invariant subset + add angle velocities.
+
+    Drops: arm XYZ (63:72), arm velocity (135:144), scale (147:148),
+           elbow angle (163:164), arm validity (186:189), arm coverage (190:191),
+           arm angle validity (206:207).
+    Adds:  hand angle velocities (frame-to-frame diff of hand angles).
+    """
+    out = []
+    for it in items:
+        X = it["X"]  # (T, 207)
+        T = X.shape[0]
+
+        # Extract condition-invariant channels from 207-dim layout
+        hand_xyz       = X[:, 0:63]        # hand pose (21j×3)
+        hand_vel_xyz   = X[:, 72:135]      # hand vel (21j×3), skip arm vel 135:144
+        vel_wrist      = X[:, 144:147]     # wrist velocity
+        hand_angles    = X[:, 148:163]     # 15 hand angles (skip elbow at 163)
+
+        # Compute hand angle velocities (frame diff, zero-padded at start)
+        angle_vel = np.zeros_like(hand_angles)
+        if T > 1:
+            angle_vel[1:] = hand_angles[1:] - hand_angles[:-1]
+
+        # Validity channels (skip arm-related)
+        frame_valid    = X[:, 164:165]
+        hand_jv        = X[:, 165:186]     # 21 hand joint validity
+        hand_cov       = X[:, 189:190]     # hand coverage
+        hand_av        = X[:, 191:206]     # 15 hand angle validity
+
+        X_new = np.concatenate([
+            hand_xyz,          # 63
+            hand_vel_xyz,      # 63
+            vel_wrist,         # 3
+            hand_angles,       # 15
+            angle_vel,         # 15
+            frame_valid,       # 1
+            hand_jv,           # 21
+            hand_cov,          # 1
+            hand_av,           # 15
+        ], axis=1).astype(np.float32)  # total: 197
+
+        out.append(dict(path=it["path"], X=X_new, valid=it["valid"],
+                        y42=it["y42"], cond=it["cond"], pid=it["pid"]))
+    return out
 
 
 # ================================================================
@@ -922,6 +1003,15 @@ def main():
     if not items:
         log.error("No training clips found."); return
 
+    # Apply LOCO feature selection if requested
+    global N_CONTINUOUS, FEATURE_BLOCKS
+    if args.loco_features:
+        items = select_loco_features(items)
+        N_CONTINUOUS = N_CONTINUOUS_LOCO
+        FEATURE_BLOCKS = FEATURE_BLOCKS_LOCO
+        log.info(f"LOCO features: {items[0]['X'].shape[-1]}-dim "
+                 f"(N_CONTINUOUS={N_CONTINUOUS})")
+
     n_classes = args.n_classes
     if args.eval_mode in ("loco", "loco_nested_loso") and n_classes != 7:
         log.warning("LOCO mode forces n_classes=7 (condition-invariant gesture labels)")
@@ -932,7 +1022,7 @@ def main():
 
     in_dim = items[0]["X"].shape[-1]
     log.info(f"N={len(items)}, in_dim={in_dim}, n_classes={n_classes}, N_CONTINUOUS={N_CONTINUOUS}")
-    if in_dim != 207:
+    if in_dim != 207 and not args.loco_features:
         log.warning(f"Expected 207-dim but got {in_dim}.")
 
     aug_cfg = None if args.no_aug else dict(
