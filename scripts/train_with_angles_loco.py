@@ -152,21 +152,13 @@ def parse_args():
     ap.add_argument("--save_path", type=str, default="runs/xyz_angles_loco")
     ap.add_argument("--n_classes", type=int, default=7, choices=[7, 42])
 
-    ap.add_argument("--eval_mode", type=str, default="loco", choices=["loco", "loso", "kfold"])
+    ap.add_argument("--eval_mode", type=str, default="loco",
+                    choices=["loco", "loco_nested_loso", "loso", "kfold"],
+                    help="loco: hold out one condition, split its subjects into val/test, "
+                         "train on remaining conditions (all subjects). "
+                         "loco_nested_loso: same but also remove val/test subjects from "
+                         "training — no subject or condition leakage anywhere.")
     ap.add_argument("--k", type=int, default=5)
-    ap.add_argument("--loco_subject_val", action="store_true", default=False,
-                    help="In LOCO mode, hold out one subject from training conditions for val "
-                         "instead of using a held-out condition. Prevents subject leakage between "
-                         "train and val splits.")
-    ap.add_argument("--loco_nested_loso", action="store_true", default=False,
-                    help="Full nested LOCO x LOSO: for each held-out condition, also iterate "
-                         "over held-out subjects for test. No subject overlap between train and "
-                         "test. Produces n_conditions x n_subjects folds.")
-    ap.add_argument("--loco_strict", action="store_true", default=False,
-                    help="Strict LOCO: hold out one condition, split two subjects from that "
-                         "condition into val and test, train on remaining conditions x remaining "
-                         "subjects. No subject or condition leakage anywhere. "
-                         "Produces n_conditions x n_subjects*(n_subjects-1) folds.")
 
     ap.add_argument("--hidden", type=int, default=256)
     ap.add_argument("--lstm_layers", type=int, default=2)
@@ -544,7 +536,7 @@ class SupConLoss(nn.Module):
             return torch.tensor(0.0, device=features.device)
 
         # (B, B) cosine similarity (features already L2-normed)
-        sim = features @ features.T / self.temperature
+        sim = (features @ features.T).clamp(-1, 1) / self.temperature
 
         # Mask: same label = positive, diagonal = excluded
         labels = labels.unsqueeze(1)
@@ -674,7 +666,9 @@ class AttentionBiLSTM(nn.Module):
         pooled = self._encode(x, mask)
         logits = self.head(pooled)
         z = self.contrast_proj(pooled)
-        z = nn.functional.normalize(z, dim=-1)
+        # Clamp before normalize to avoid NaN from near-zero vectors
+        z = z.clamp(-100, 100)
+        z = nn.functional.normalize(z, dim=-1, eps=1e-6)
         return logits, z
 
 
@@ -822,79 +816,38 @@ def plot_training_curves(history, save_path):
 # ================================================================
 # LOCO / LOSO / K-fold splits
 # ================================================================
-def generate_loco_splits(items, subject_val=False):
+def generate_loco_splits(items):
     """Leave-One-Condition-Out.
 
-    Args:
-        items: list of clip dicts with 'cond' and 'pid' keys.
-        subject_val: if True, val set is one subject held out from the
-            *training* conditions (no condition held out for val).  This
-            prevents subject leakage between train and val while keeping
-            all non-test conditions available for training.
-            If False (default), a second condition is held out for val.
+    Hold out one condition.  Split that condition's subjects in half —
+    first half for val, second half for test.  Train on remaining
+    conditions with ALL subjects.
+
+    Produces n_conditions folds (one per condition).
     """
     conds = sorted(set(it["cond"] for it in items))
     pids  = sorted(set(it["pid"] for it in items), key=lambda x: int(x))
-    for i, test_cond in enumerate(conds):
-        test  = [it for it in items if it["cond"] == test_cond]
-        rest  = [it for it in items if it["cond"] != test_cond]
-        if subject_val:
-            # Hold out one subject from training conditions for val
-            val_pid = pids[i % len(pids)]
-            train = [it for it in rest if it["pid"] != val_pid]
-            val   = [it for it in rest if it["pid"] == val_pid]
-        else:
-            # Hold out next condition for val
-            val_cond = conds[(i + 1) % len(conds)]
-            train = [it for it in rest if it["cond"] != val_cond]
-            val   = [it for it in rest if it["cond"] == val_cond]
+    for test_cond in conds:
+        mid = len(pids) // 2
+        val_pids  = set(pids[:mid])
+        test_pids = set(pids[mid:])
+        val   = [it for it in items if it["cond"] == test_cond and it["pid"] in val_pids]
+        test  = [it for it in items if it["cond"] == test_cond and it["pid"] in test_pids]
+        train = [it for it in items if it["cond"] != test_cond]
+        if not test or not val:
+            continue
         yield (train, val, test, f"LOCO-cond{test_cond}")
 
 
 def generate_loco_nested_loso_splits(items):
-    """Nested LOCO x LOSO: hold out one condition AND one subject.
+    """Leave-One-Condition-Out + Leave-One-Subject-Out (nested).
 
-    Outer loop: condition (test condition).
-    Inner loop: subject (test subject — removed from train AND test).
+    Hold out one condition.  From that condition, one subject for test,
+    another for val.  Train on remaining conditions with remaining
+    subjects (val/test subjects removed from training too).
+    No subject or condition leakage anywhere.
 
-    For each (condition, subject) pair:
-      test:  clips from held-out condition AND held-out subject only
-      val:   one other subject held out from training conditions
-      train: remaining conditions x remaining subjects
-
-    Produces n_conditions x n_subjects folds. No subject or condition
-    leakage between train and test.
-    """
-    conds = sorted(set(it["cond"] for it in items))
-    pids  = sorted(set(it["pid"] for it in items), key=lambda x: int(x))
-    for ci, test_cond in enumerate(conds):
-        for pi, test_pid in enumerate(pids):
-            test = [it for it in items
-                    if it["cond"] == test_cond and it["pid"] == test_pid]
-            if not test:
-                continue
-            # Remaining: exclude test condition and test subject entirely
-            rest = [it for it in items
-                    if it["cond"] != test_cond and it["pid"] != test_pid]
-            # Val: hold out one other subject from rest
-            val_pid = pids[(pi + 1) % len(pids)]
-            if val_pid == test_pid:
-                val_pid = pids[(pi + 2) % len(pids)]
-            val   = [it for it in rest if it["pid"] == val_pid]
-            train = [it for it in rest if it["pid"] != val_pid]
-            yield (train, val, test, f"LOCO-cond{test_cond}_LOSO-{test_pid}")
-
-
-def generate_loco_strict_splits(items):
-    """Strict LOCO: no subject or condition leakage in train, val, or test.
-
-    For each (test_cond, test_pid, val_pid) combination:
-      test:  held-out condition, test subject only
-      val:   held-out condition, val subject only (measures condition generalization)
-      train: remaining conditions, excluding both test and val subjects
-
-    Early stopping on val optimizes for condition generalization since val
-    is from the unseen condition.
+    Produces n_conditions x n_subjects folds.
     """
     conds = sorted(set(it["cond"] for it in items))
     pids  = sorted(set(it["pid"] for it in items), key=lambda x: int(x))
@@ -968,7 +921,7 @@ def main():
         log.error("No training clips found."); return
 
     n_classes = args.n_classes
-    if args.eval_mode == "loco" and n_classes != 7:
+    if args.eval_mode in ("loco", "loco_nested_loso") and n_classes != 7:
         log.warning("LOCO mode forces n_classes=7 (condition-invariant gesture labels)")
         n_classes = 7
     if n_classes == 7:
@@ -992,19 +945,14 @@ def main():
     )
     mixup_alpha = 0.0 if args.no_aug else args.mixup_alpha
 
-    if args.eval_mode == "loco" and args.loco_strict:
-        splits = list(generate_loco_strict_splits(items))
+    if args.eval_mode == "loco":
+        splits = list(generate_loco_splits(items))
         priority_conds = {"cond3", "cond5"}
         splits.sort(key=lambda s: (0 if any(c in s[3] for c in priority_conds) else 1))
-    elif args.eval_mode == "loco" and args.loco_nested_loso:
+    elif args.eval_mode == "loco_nested_loso":
         splits = list(generate_loco_nested_loso_splits(items))
         priority_conds = {"cond3", "cond5"}
         splits.sort(key=lambda s: (0 if any(c in s[3] for c in priority_conds) else 1))
-    elif args.eval_mode == "loco":
-        splits = list(generate_loco_splits(items, subject_val=args.loco_subject_val))
-        # Sort splits so 4th constraint (idx 3) and 6th constraint (idx 5) are first
-        priority_conds = {"LOCO-cond3", "LOCO-cond5"}
-        splits.sort(key=lambda s: (0 if s[3] in priority_conds else 1))
     elif args.eval_mode == "loso":
         splits = list(generate_loso_splits(items))
     else:
