@@ -162,6 +162,11 @@ def parse_args():
                     help="Full nested LOCO x LOSO: for each held-out condition, also iterate "
                          "over held-out subjects for test. No subject overlap between train and "
                          "test. Produces n_conditions x n_subjects folds.")
+    ap.add_argument("--loco_strict", action="store_true", default=False,
+                    help="Strict LOCO: hold out one condition, split two subjects from that "
+                         "condition into val and test, train on remaining conditions x remaining "
+                         "subjects. No subject or condition leakage anywhere. "
+                         "Produces n_conditions x n_subjects*(n_subjects-1) folds.")
 
     ap.add_argument("--hidden", type=int, default=256)
     ap.add_argument("--lstm_layers", type=int, default=2)
@@ -880,6 +885,38 @@ def generate_loco_nested_loso_splits(items):
             yield (train, val, test, f"LOCO-cond{test_cond}_LOSO-{test_pid}")
 
 
+def generate_loco_strict_splits(items):
+    """Strict LOCO: no subject or condition leakage in train, val, or test.
+
+    For each (test_cond, test_pid, val_pid) combination:
+      test:  held-out condition, test subject only
+      val:   held-out condition, val subject only (measures condition generalization)
+      train: remaining conditions, excluding both test and val subjects
+
+    Early stopping on val optimizes for condition generalization since val
+    is from the unseen condition.
+    """
+    conds = sorted(set(it["cond"] for it in items))
+    pids  = sorted(set(it["pid"] for it in items), key=lambda x: int(x))
+    for test_cond in conds:
+        for pi, test_pid in enumerate(pids):
+            val_pid = pids[(pi + 1) % len(pids)]
+            if val_pid == test_pid:
+                val_pid = pids[(pi + 2) % len(pids)]
+            test = [it for it in items
+                    if it["cond"] == test_cond and it["pid"] == test_pid]
+            val  = [it for it in items
+                    if it["cond"] == test_cond and it["pid"] == val_pid]
+            if not test or not val:
+                continue
+            train = [it for it in items
+                     if it["cond"] != test_cond
+                     and it["pid"] != test_pid
+                     and it["pid"] != val_pid]
+            yield (train, val, test,
+                   f"LOCO-cond{test_cond}_test-{test_pid}_val-{val_pid}")
+
+
 def generate_loso_splits(items):
     pids = sorted(set(it["pid"] for it in items), key=lambda x: int(x))
     for i, test_pid in enumerate(pids):
@@ -955,7 +992,11 @@ def main():
     )
     mixup_alpha = 0.0 if args.no_aug else args.mixup_alpha
 
-    if args.eval_mode == "loco" and args.loco_nested_loso:
+    if args.eval_mode == "loco" and args.loco_strict:
+        splits = list(generate_loco_strict_splits(items))
+        priority_conds = {"cond3", "cond5"}
+        splits.sort(key=lambda s: (0 if any(c in s[3] for c in priority_conds) else 1))
+    elif args.eval_mode == "loco" and args.loco_nested_loso:
         splits = list(generate_loco_nested_loso_splits(items))
         priority_conds = {"cond3", "cond5"}
         splits.sort(key=lambda s: (0 if any(c in s[3] for c in priority_conds) else 1))
@@ -980,6 +1021,14 @@ def main():
         log.info(f"\n{'='*60}")
         log.info(f"Fold {fold_i+1}/{len(splits)}: {fold_name}  "
                  f"(train={len(train_items)} val={len(val_items)} test={len(test_items)})")
+        test_conds = sorted(set(it["cond"] for it in test_items))
+        train_conds = sorted(set(it["cond"] for it in train_items))
+        val_conds = sorted(set(it["cond"] for it in val_items))
+        test_pids = sorted(set(it["pid"] for it in test_items), key=lambda x: int(x))
+        val_pids = sorted(set(it["pid"] for it in val_items), key=lambda x: int(x))
+        log.info(f"  Test  conditions={test_conds}  subjects={test_pids}")
+        log.info(f"  Val   conditions={val_conds}  subjects={val_pids}")
+        log.info(f"  Train conditions={train_conds}")
         log.info(f"{'='*60}")
 
         mu, sd, scale_mean = standardize_fit(train_items, args.normalize_scale_channel)
