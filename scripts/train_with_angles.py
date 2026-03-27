@@ -149,8 +149,8 @@ def parse_args():
     ap.add_argument("--save_path", type=str, default="runs/xyz_angles")
     ap.add_argument("--n_classes", type=int, default=7, choices=[7, 42])
     ap.add_argument("--model", type=str, default="bilstm",
-                    choices=["bilstm", "unet1d", "resnet1d"],
-                    help="Model architecture: bilstm (default), unet1d, or resnet1d")
+                    choices=["bilstm", "unet1d", "resnet1d", "unet1d_lstm", "resnet1d_lstm", "stgcn"],
+                    help="Model architecture: bilstm, unet1d, resnet1d, unet1d_lstm, resnet1d_lstm, stgcn")
 
     ap.add_argument("--eval_mode", type=str, default="loso", choices=["loso", "kfold"])
     ap.add_argument("--k", type=int, default=5)
@@ -200,6 +200,10 @@ def parse_args():
     ap.add_argument("--seed", type=int, default=1337)
     ap.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--num_workers", type=int, default=0)
+    ap.add_argument("--compress_joints", action="store_true", default=False,
+                    help="Compress first 144 joint features via CNN before temporal model")
+    ap.add_argument("--compress_joints_dim", type=int, default=32,
+                    help="Output dim of joint compression CNN (default 32)")
     ap.add_argument("--condition_vec", action="store_true", default=False,
                     help="Append 6-dim one-hot condition vector (y42 // 7) to features")
 
@@ -680,19 +684,348 @@ class ResNet1D(nn.Module):
 
 
 # ================================================================
+# Model: UNet1D encoder + BiLSTM + Attention
+# ================================================================
+class UNet1DLstm(nn.Module):
+    def __init__(self, in_dim, n_classes, base_channels=64, hidden=128,
+                 lstm_layers=2, attn_heads=4, dropout=0.4):
+        super().__init__()
+        c = base_channels
+        self.input_proj = nn.Linear(in_dim, c)
+        # Encoder
+        self.enc1 = _ConvBlock1D(c, c)
+        self.enc2 = _ConvBlock1D(c, c * 2)
+        self.enc3 = _ConvBlock1D(c * 2, c * 4)
+        self.pool = nn.MaxPool1d(2)
+        # Bottleneck
+        self.bottleneck = _ConvBlock1D(c * 4, c * 8)
+        # Decoder
+        self.up3 = nn.ConvTranspose1d(c * 8, c * 4, kernel_size=2, stride=2)
+        self.dec3 = _ConvBlock1D(c * 8, c * 4)
+        self.up2 = nn.ConvTranspose1d(c * 4, c * 2, kernel_size=2, stride=2)
+        self.dec2 = _ConvBlock1D(c * 4, c * 2)
+        self.up1 = nn.ConvTranspose1d(c * 2, c, kernel_size=2, stride=2)
+        self.dec1 = _ConvBlock1D(c * 2, c)
+        # BiLSTM + Attention
+        self.lstm = nn.LSTM(c, hidden, lstm_layers,
+                            dropout=dropout if lstm_layers > 1 else 0.0,
+                            batch_first=True, bidirectional=True)
+        lstm_out_dim = hidden * 2
+        self.attn_pool = TemporalAttentionPool(lstm_out_dim, num_heads=attn_heads)
+        self.head = nn.Sequential(
+            nn.LayerNorm(lstm_out_dim), nn.Dropout(dropout),
+            nn.Linear(lstm_out_dim, n_classes),
+        )
+
+    def _pad_to_divisible(self, x, divisor=8):
+        T = x.size(2)
+        remainder = T % divisor
+        if remainder == 0:
+            return x, T
+        pad_len = divisor - remainder
+        x = nn.functional.pad(x, (0, pad_len))
+        return x, T
+
+    def forward(self, x, mask):
+        x = self.input_proj(x)
+        x = x * mask.unsqueeze(-1)
+        x = x.transpose(1, 2)
+        x, orig_T = self._pad_to_divisible(x)
+        # Encoder
+        e1 = self.enc1(x)
+        e2 = self.enc2(self.pool(e1))
+        e3 = self.enc3(self.pool(e2))
+        b = self.bottleneck(self.pool(e3))
+        # Decoder
+        d3 = self.dec3(torch.cat([self.up3(b), e3], dim=1))
+        d2 = self.dec2(torch.cat([self.up2(d3), e2], dim=1))
+        d1 = self.dec1(torch.cat([self.up1(d2), e1], dim=1))
+        d1 = d1[:, :, :orig_T].transpose(1, 2)  # (B, T, C)
+        # BiLSTM
+        lengths = mask.sum(dim=1).clamp(min=1).to(torch.int64)
+        packed = nn.utils.rnn.pack_padded_sequence(
+            d1, lengths.cpu(), batch_first=True, enforce_sorted=False)
+        lstm_out, _ = self.lstm(packed)
+        lstm_out, _ = nn.utils.rnn.pad_packed_sequence(lstm_out, batch_first=True)
+        T_out = d1.size(1)
+        if lstm_out.size(1) < T_out:
+            pad = torch.zeros(lstm_out.size(0), T_out - lstm_out.size(1), lstm_out.size(2),
+                              device=lstm_out.device, dtype=lstm_out.dtype)
+            lstm_out = torch.cat([lstm_out, pad], dim=1)
+        # Attention pool
+        pooled = self.attn_pool(lstm_out, key_padding_mask=~(mask[:, :T_out].bool()))
+        return self.head(pooled)
+
+
+# ================================================================
+# Model: ResNet1D encoder + BiLSTM + Attention
+# ================================================================
+class ResNet1DLstm(nn.Module):
+    def __init__(self, in_dim, n_classes, base_channels=64, hidden=128,
+                 lstm_layers=2, attn_heads=4, dropout=0.4):
+        super().__init__()
+        c = base_channels
+        self.input_proj = nn.Linear(in_dim, c)
+        self.stages = nn.Sequential(
+            _ResStage1D(c, c, n_blocks=2),
+            _ResStage1D(c, c * 2, n_blocks=2),
+            _ResStage1D(c * 2, c * 4, n_blocks=2),
+            _ResStage1D(c * 4, c * 8, n_blocks=2),
+        )
+        # BiLSTM + Attention
+        self.lstm = nn.LSTM(c * 8, hidden, lstm_layers,
+                            dropout=dropout if lstm_layers > 1 else 0.0,
+                            batch_first=True, bidirectional=True)
+        lstm_out_dim = hidden * 2
+        self.attn_pool = TemporalAttentionPool(lstm_out_dim, num_heads=attn_heads)
+        self.head = nn.Sequential(
+            nn.LayerNorm(lstm_out_dim), nn.Dropout(dropout),
+            nn.Linear(lstm_out_dim, n_classes),
+        )
+        self.mask_pool = nn.MaxPool1d(16, stride=16)  # 4 stages, each stride 2 → 2^4=16
+
+    def forward(self, x, mask):
+        x = self.input_proj(x)
+        x = x * mask.unsqueeze(-1)
+        x = x.transpose(1, 2)              # (B, C, T)
+        x = self.stages(x)                  # (B, C*8, T')
+        x = x.transpose(1, 2)              # (B, T', C*8)
+        # Downsample mask to match T'
+        T_prime = x.size(1)
+        mask_ds = self.mask_pool(mask.unsqueeze(1).float()).squeeze(1)  # (B, T')
+        mask_ds = mask_ds[:, :T_prime]
+        # BiLSTM
+        lengths = mask_ds.sum(dim=1).clamp(min=1).to(torch.int64)
+        packed = nn.utils.rnn.pack_padded_sequence(
+            x, lengths.cpu(), batch_first=True, enforce_sorted=False)
+        lstm_out, _ = self.lstm(packed)
+        lstm_out, _ = nn.utils.rnn.pad_packed_sequence(lstm_out, batch_first=True)
+        if lstm_out.size(1) < T_prime:
+            pad = torch.zeros(lstm_out.size(0), T_prime - lstm_out.size(1), lstm_out.size(2),
+                              device=lstm_out.device, dtype=lstm_out.dtype)
+            lstm_out = torch.cat([lstm_out, pad], dim=1)
+        # Attention pool
+        pooled = self.attn_pool(lstm_out, key_padding_mask=~(mask_ds[:, :T_prime].bool()))
+        return self.head(pooled)
+
+
+# ================================================================
+# Model: Spatio-Temporal Graph Convolutional Network (ST-GCN)
+# ================================================================
+# Skeleton adjacency: 21 MediaPipe hand joints + 3 arm joints (shoulder=21, elbow=22, arm_wrist=23)
+SKELETON_EDGES = [
+    # Thumb
+    (0, 1), (1, 2), (2, 3), (3, 4),
+    # Index
+    (0, 5), (5, 6), (6, 7), (7, 8),
+    # Middle
+    (0, 9), (9, 10), (10, 11), (11, 12),
+    # Ring
+    (0, 13), (13, 14), (14, 15), (15, 16),
+    # Pinky
+    (0, 17), (17, 18), (18, 19), (19, 20),
+    # Arm
+    (21, 22), (22, 23),
+    # Arm-to-hand wrist
+    (23, 0),
+]
+NUM_JOINTS = 24
+
+
+def _build_adjacency():
+    """Build normalized adjacency matrix with self-loops for the hand+arm skeleton."""
+    A = np.eye(NUM_JOINTS, dtype=np.float32)
+    for i, j in SKELETON_EDGES:
+        A[i, j] = 1.0
+        A[j, i] = 1.0
+    # Normalize: D^{-1/2} A D^{-1/2}
+    D = A.sum(axis=1)
+    D_inv_sqrt = np.diag(1.0 / np.sqrt(D))
+    A_norm = D_inv_sqrt @ A @ D_inv_sqrt
+    return A_norm
+
+
+class _STGCNBlock(nn.Module):
+    """One ST-GCN block: graph conv → temporal conv, with residual."""
+    def __init__(self, in_ch, out_ch, A, temporal_stride=1):
+        super().__init__()
+        self.A = A  # will be registered as buffer by parent
+        # Graph convolution: per-node feature transform, then aggregate by A
+        self.gcn_w = nn.Conv2d(in_ch, out_ch, kernel_size=1)
+        self.gcn_bn = nn.BatchNorm2d(out_ch)
+        # Learnable edge importance weighting
+        self.edge_importance = nn.Parameter(torch.ones_like(A))
+        # Temporal convolution: conv over time axis per joint
+        self.tcn = nn.Sequential(
+            nn.Conv2d(out_ch, out_ch, kernel_size=(9, 1), padding=(4, 0), stride=(temporal_stride, 1)),
+            nn.BatchNorm2d(out_ch),
+        )
+        self.act = nn.GELU()
+        # Residual
+        if in_ch != out_ch or temporal_stride != 1:
+            self.residual = nn.Sequential(
+                nn.Conv2d(in_ch, out_ch, kernel_size=1, stride=(temporal_stride, 1)),
+                nn.BatchNorm2d(out_ch),
+            )
+        else:
+            self.residual = nn.Identity()
+
+    def forward(self, x):
+        # x: (B, C, T, V)
+        res = self.residual(x)
+        # Graph conv: x @ (A * importance)
+        A_w = self.A * self.edge_importance
+        x = self.gcn_w(x)                          # (B, out_ch, T, V)
+        x = torch.einsum('bctv,vw->bctw', x, A_w)  # aggregate neighbors
+        x = self.act(self.gcn_bn(x))
+        # Temporal conv
+        x = self.act(self.tcn(x) + res)
+        return x
+
+
+class SpatioTemporalGCN(nn.Module):
+    def __init__(self, in_dim, n_classes, dropout=0.4):
+        super().__init__()
+        A_np = _build_adjacency()
+        A = torch.from_numpy(A_np)
+        self.register_buffer('A', A)
+
+        # ST-GCN blocks: 6 → 64 → 128 → 256
+        self.blocks = nn.ModuleList([
+            _STGCNBlock(6, 64, A, temporal_stride=1),
+            _STGCNBlock(64, 128, A, temporal_stride=2),
+            _STGCNBlock(128, 256, A, temporal_stride=2),
+        ])
+        # Assign the shared adjacency buffer to each block
+        for block in self.blocks:
+            block.A = A
+
+        # Number of non-joint features (everything after first 144)
+        self.n_rest = in_dim - 144
+
+        head_dim = 256 + self.n_rest if self.n_rest > 0 else 256
+        self.head = nn.Sequential(
+            nn.LayerNorm(head_dim), nn.Dropout(dropout), nn.Linear(head_dim, n_classes),
+        )
+
+    def forward(self, x, mask):
+        # x: (B, T, 207), mask: (B, T)
+        B, T, _ = x.shape
+        # Extract joint features: pose(72) + vel(72) → (B, T, 24, 3) each
+        pose = x[:, :, :72].reshape(B, T, 24, 3)
+        vel = x[:, :, 72:144].reshape(B, T, 24, 3)
+        # Stack as (B, 6, T, 24) — 6 channels per joint
+        graph_in = torch.cat([pose, vel], dim=-1)     # (B, T, 24, 6)
+        graph_in = graph_in.permute(0, 3, 1, 2)       # (B, 6, T, 24)
+        # Zero out invalid frames
+        graph_in = graph_in * mask.unsqueeze(1).unsqueeze(-1)
+
+        # ST-GCN blocks
+        h = graph_in
+        for block in self.blocks:
+            h = block(h)                               # (B, 256, T', 24)
+
+        # Global average pool over time and joints
+        pooled = h.mean(dim=(2, 3))                    # (B, 256)
+
+        # Concat non-joint features (masked mean over time)
+        if self.n_rest > 0:
+            rest = x[:, :, 144:]                       # (B, T, 63)
+            mask_f = mask.unsqueeze(-1)                # (B, T, 1)
+            rest_pooled = (rest * mask_f).sum(dim=1) / mask_f.sum(dim=1).clamp(min=1)
+            pooled = torch.cat([pooled, rest_pooled], dim=-1)
+
+        return self.head(pooled)
+
+
+# ================================================================
+# Joint compression: CNN over joint dimension
+# ================================================================
+class JointCompressor(nn.Module):
+    """Compress 144 pose+velocity features via 1D CNN over the joint axis.
+
+    Reshapes (B, T, 144) → (B*T, 2, 72) treating pose and velocity as
+    2 channels over 24 joints × 3 coords, then compresses to out_dim.
+    """
+    def __init__(self, out_dim=32):
+        super().__init__()
+        self.cnn = nn.Sequential(
+            nn.Conv1d(2, 16, kernel_size=3, padding=1),
+            nn.BatchNorm1d(16), nn.GELU(),
+            nn.Conv1d(16, 32, kernel_size=3, padding=1),
+            nn.BatchNorm1d(32), nn.GELU(),
+            nn.AdaptiveAvgPool1d(1),
+        )
+        self.fc = nn.Linear(32, out_dim)
+
+    def forward(self, joints):
+        # joints: (B, T, 144)
+        B, T, _ = joints.shape
+        x = joints.reshape(B * T, 2, 72)   # pose(72) + vel(72) as 2 channels
+        x = self.cnn(x).squeeze(-1)         # (B*T, 32)
+        x = self.fc(x)                      # (B*T, out_dim)
+        return x.reshape(B, T, -1)
+
+
+class JointCompressWrapper(nn.Module):
+    """Wraps any temporal model with joint compression on the first 144 features.
+
+    Drops per-joint validity channels that are meaningless after compression.
+    Keeps: vel_wrist(3), scale(1), angles(16), frame_valid(1), hand_cov(1), arm_cov(1).
+    Drops: joint_valid(21), arm_valid(3), hand_angle_valid(15), arm_angle_valid(1) = 40 channels.
+    """
+    # Indices into the 63 remaining channels (i.e., x[:, :, 144:])
+    # that we KEEP: vel_wrist[0:3], scale[3], angles[4:20], frame_valid[20],
+    #               hand_cov[45], arm_cov[46]
+    _KEEP_IDX = list(range(0, 21)) + [45, 46]  # 21 + 2 = 23 channels kept
+
+    def __init__(self, compressor, temporal_model):
+        super().__init__()
+        self.compressor = compressor
+        self.temporal_model = temporal_model
+
+    def forward(self, x, mask):
+        joints = x[:, :, :144]
+        rest = x[:, :, 144:][:, :, self._KEEP_IDX]
+        compressed = self.compressor(joints)
+        x_new = torch.cat([compressed, rest], dim=-1)
+        return self.temporal_model(x_new, mask)
+
+
+# ================================================================
 # Model factory
 # ================================================================
 def build_model(args, in_dim, n_classes):
+    model_in_dim = in_dim
+    if args.compress_joints:
+        # compress_joints_dim + 23 kept channels (vel_wrist, scale, angles, frame_valid, hand_cov, arm_cov)
+        model_in_dim = args.compress_joints_dim + len(JointCompressWrapper._KEEP_IDX)
+
     if args.model == "bilstm":
-        return AttentionBiLSTM(in_dim, n_classes, hidden=args.hidden,
-                               lstm_layers=args.lstm_layers, attn_heads=args.attn_heads,
-                               proj_dim=args.proj_dim, dropout=args.dropout)
+        temporal = AttentionBiLSTM(model_in_dim, n_classes, hidden=args.hidden,
+                                   lstm_layers=args.lstm_layers, attn_heads=args.attn_heads,
+                                   proj_dim=args.proj_dim, dropout=args.dropout)
     elif args.model == "unet1d":
-        return UNet1D(in_dim, n_classes, base_channels=args.proj_dim, dropout=args.dropout)
+        temporal = UNet1D(model_in_dim, n_classes, base_channels=args.proj_dim, dropout=args.dropout)
     elif args.model == "resnet1d":
-        return ResNet1D(in_dim, n_classes, base_channels=args.proj_dim, dropout=args.dropout)
+        temporal = ResNet1D(model_in_dim, n_classes, base_channels=args.proj_dim, dropout=args.dropout)
+    elif args.model == "unet1d_lstm":
+        temporal = UNet1DLstm(model_in_dim, n_classes, base_channels=args.proj_dim,
+                              hidden=args.hidden, lstm_layers=args.lstm_layers,
+                              attn_heads=args.attn_heads, dropout=args.dropout)
+    elif args.model == "resnet1d_lstm":
+        temporal = ResNet1DLstm(model_in_dim, n_classes, base_channels=args.proj_dim,
+                                hidden=args.hidden, lstm_layers=args.lstm_layers,
+                                attn_heads=args.attn_heads, dropout=args.dropout)
+    elif args.model == "stgcn":
+        # ST-GCN handles its own feature extraction; bypass compress_joints
+        return SpatioTemporalGCN(in_dim, n_classes, dropout=args.dropout)
     else:
         raise ValueError(f"Unknown model: {args.model}")
+
+    if args.compress_joints:
+        return JointCompressWrapper(JointCompressor(args.compress_joints_dim), temporal)
+    return temporal
 
 
 # ================================================================
