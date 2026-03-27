@@ -148,6 +148,9 @@ def parse_args():
                     help="Directories with processed *.npz clips from landmark_with_xyz.py")
     ap.add_argument("--save_path", type=str, default="runs/xyz_angles")
     ap.add_argument("--n_classes", type=int, default=7, choices=[7, 42])
+    ap.add_argument("--model", type=str, default="bilstm",
+                    choices=["bilstm", "unet1d", "resnet1d"],
+                    help="Model architecture: bilstm (default), unet1d, or resnet1d")
 
     ap.add_argument("--eval_mode", type=str, default="loso", choices=["loso", "kfold"])
     ap.add_argument("--k", type=int, default=5)
@@ -197,6 +200,8 @@ def parse_args():
     ap.add_argument("--seed", type=int, default=1337)
     ap.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--num_workers", type=int, default=0)
+    ap.add_argument("--condition_vec", action="store_true", default=False,
+                    help="Append 6-dim one-hot condition vector (y42 // 7) to features")
 
     args = ap.parse_args()
     if args.no_aug_scale_jitter:
@@ -277,7 +282,7 @@ def load_items(roots):
             # Compute and insert angle channels before standardization
             X = insert_angles(X_raw)            # (T, 207)
             pid = str(int(z["subject_id"])) if "subject_id" in z else extract_participant_id(path)
-            items.append(dict(path=path, X=X, valid=valid, y42=y42, pid=pid))
+            items.append(dict(path=path, X=X, valid=valid, y42=y42, pid=pid, condition=y42 // 7))
     print(f"Loaded {len(items)} clips from {len(set(it['pid'] for it in items))} participants.")
     return items
 
@@ -539,6 +544,158 @@ class AttentionBiLSTM(nn.Module):
 
 
 # ================================================================
+# Model: 1D UNet for temporal classification
+# ================================================================
+class _ConvBlock1D(nn.Module):
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv1d(in_ch, out_ch, kernel_size=3, padding=1),
+            nn.BatchNorm1d(out_ch), nn.GELU(),
+            nn.Conv1d(out_ch, out_ch, kernel_size=3, padding=1),
+            nn.BatchNorm1d(out_ch), nn.GELU(),
+        )
+
+    def forward(self, x):
+        return self.block(x)
+
+
+class UNet1D(nn.Module):
+    def __init__(self, in_dim, n_classes, base_channels=64, dropout=0.4):
+        super().__init__()
+        c = base_channels
+        self.input_proj = nn.Linear(in_dim, c)
+        # Encoder
+        self.enc1 = _ConvBlock1D(c, c)
+        self.enc2 = _ConvBlock1D(c, c * 2)
+        self.enc3 = _ConvBlock1D(c * 2, c * 4)
+        self.pool = nn.MaxPool1d(2)
+        # Bottleneck
+        self.bottleneck = _ConvBlock1D(c * 4, c * 8)
+        # Decoder
+        self.up3 = nn.ConvTranspose1d(c * 8, c * 4, kernel_size=2, stride=2)
+        self.dec3 = _ConvBlock1D(c * 8, c * 4)   # concat with enc3
+        self.up2 = nn.ConvTranspose1d(c * 4, c * 2, kernel_size=2, stride=2)
+        self.dec2 = _ConvBlock1D(c * 4, c * 2)   # concat with enc2
+        self.up1 = nn.ConvTranspose1d(c * 2, c, kernel_size=2, stride=2)
+        self.dec1 = _ConvBlock1D(c * 2, c)       # concat with enc1
+        # Head
+        self.head = nn.Sequential(
+            nn.LayerNorm(c), nn.Dropout(dropout), nn.Linear(c, n_classes),
+        )
+
+    def _pad_to_divisible(self, x, divisor=8):
+        """Pad time dimension so it's divisible by divisor (needed for 3 pool layers)."""
+        T = x.size(2)
+        remainder = T % divisor
+        if remainder == 0:
+            return x, T
+        pad_len = divisor - remainder
+        x = nn.functional.pad(x, (0, pad_len))
+        return x, T
+
+    def forward(self, x, mask):
+        # x: (B, T, F), mask: (B, T)
+        x = self.input_proj(x)          # (B, T, C)
+        x = x * mask.unsqueeze(-1)      # zero out padded frames
+        x = x.transpose(1, 2)           # (B, C, T) for conv1d
+        x, orig_T = self._pad_to_divisible(x)
+        # Encoder
+        e1 = self.enc1(x)
+        e2 = self.enc2(self.pool(e1))
+        e3 = self.enc3(self.pool(e2))
+        # Bottleneck
+        b = self.bottleneck(self.pool(e3))
+        # Decoder with skip connections
+        d3 = self.up3(b)
+        d3 = self.dec3(torch.cat([d3, e3], dim=1))
+        d2 = self.up2(d3)
+        d2 = self.dec2(torch.cat([d2, e2], dim=1))
+        d1 = self.up1(d2)
+        d1 = self.dec1(torch.cat([d1, e1], dim=1))
+        # Trim back to original length
+        d1 = d1[:, :, :orig_T]         # (B, C, T)
+        d1 = d1.transpose(1, 2)        # (B, T, C)
+        # Masked global average pool
+        mask_f = mask[:, :orig_T].unsqueeze(-1)   # (B, T, 1)
+        pooled = (d1 * mask_f).sum(dim=1) / mask_f.sum(dim=1).clamp(min=1)
+        return self.head(pooled)
+
+
+# ================================================================
+# Model: 1D ResNet for temporal classification
+# ================================================================
+class _ResBlock1D(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv1d(channels, channels, kernel_size=3, padding=1),
+            nn.BatchNorm1d(channels), nn.GELU(),
+            nn.Conv1d(channels, channels, kernel_size=3, padding=1),
+            nn.BatchNorm1d(channels),
+        )
+        self.act = nn.GELU()
+
+    def forward(self, x):
+        return self.act(self.block(x) + x)
+
+
+class _ResStage1D(nn.Module):
+    def __init__(self, in_ch, out_ch, n_blocks=2):
+        super().__init__()
+        self.downsample = nn.Sequential(
+            nn.Conv1d(in_ch, out_ch, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm1d(out_ch), nn.GELU(),
+        ) if in_ch != out_ch else nn.Identity()
+        self.blocks = nn.Sequential(*[_ResBlock1D(out_ch) for _ in range(n_blocks)])
+
+    def forward(self, x):
+        return self.blocks(self.downsample(x))
+
+
+class ResNet1D(nn.Module):
+    def __init__(self, in_dim, n_classes, base_channels=64, dropout=0.4):
+        super().__init__()
+        c = base_channels
+        self.input_proj = nn.Linear(in_dim, c)
+        self.stages = nn.Sequential(
+            _ResStage1D(c, c, n_blocks=2),
+            _ResStage1D(c, c * 2, n_blocks=2),
+            _ResStage1D(c * 2, c * 4, n_blocks=2),
+            _ResStage1D(c * 4, c * 8, n_blocks=2),
+        )
+        self.head = nn.Sequential(
+            nn.LayerNorm(c * 8), nn.Dropout(dropout), nn.Linear(c * 8, n_classes),
+        )
+
+    def forward(self, x, mask):
+        # x: (B, T, F), mask: (B, T)
+        x = self.input_proj(x)          # (B, T, C)
+        x = x * mask.unsqueeze(-1)
+        x = x.transpose(1, 2)           # (B, C, T)
+        x = self.stages(x)              # (B, C*8, T')
+        # Global average pool over time
+        x = x.mean(dim=2)              # (B, C*8)
+        return self.head(x)
+
+
+# ================================================================
+# Model factory
+# ================================================================
+def build_model(args, in_dim, n_classes):
+    if args.model == "bilstm":
+        return AttentionBiLSTM(in_dim, n_classes, hidden=args.hidden,
+                               lstm_layers=args.lstm_layers, attn_heads=args.attn_heads,
+                               proj_dim=args.proj_dim, dropout=args.dropout)
+    elif args.model == "unet1d":
+        return UNet1D(in_dim, n_classes, base_channels=args.proj_dim, dropout=args.dropout)
+    elif args.model == "resnet1d":
+        return ResNet1D(in_dim, n_classes, base_channels=args.proj_dim, dropout=args.dropout)
+    else:
+        raise ValueError(f"Unknown model: {args.model}")
+
+
+# ================================================================
 # Standardization — continuous channels only
 # ================================================================
 # Channel index of the bone-length scale within the 207-dim feature vector.
@@ -723,6 +880,14 @@ def main():
     if not items:
         log.error("No training clips found."); return
 
+    if args.condition_vec:
+        for it in items:
+            T = it["X"].shape[0]
+            cond_onehot = np.zeros((T, 6), dtype=np.float32)
+            cond_onehot[:, it["condition"]] = 1.0
+            it["X"] = np.concatenate([it["X"], cond_onehot], axis=1)
+        log.info("Appended 6-dim condition one-hot → feature dim %d", items[0]["X"].shape[1])
+
     n_classes = args.n_classes
     if n_classes == 7:
         for it in items:
@@ -778,9 +943,7 @@ def main():
         dl_test  = DataLoader(ds_test,  args.batch_size, shuffle=False,
                               collate_fn=collate, num_workers=args.num_workers)
 
-        model = AttentionBiLSTM(in_dim, n_classes, hidden=args.hidden,
-                                lstm_layers=args.lstm_layers, attn_heads=args.attn_heads,
-                                proj_dim=args.proj_dim, dropout=args.dropout).to(device)
+        model = build_model(args, in_dim, n_classes).to(device)
         optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr,
                                       weight_decay=args.weight_decay)
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
@@ -831,7 +994,7 @@ def main():
         plot_confusion_matrix(y_test, p_test, n_classes,
                               f"Confusion: {fold_name}", out_dir / f"cm_{fold_name}.png")
         # Save per-fold model immediately
-        fold_artifact = dict(type="attention_bilstm_xyz_angles", in_dim=int(in_dim),
+        fold_artifact = dict(type=f"{args.model}_xyz_angles", in_dim=int(in_dim),
                              n_continuous=N_CONTINUOUS, n_classes=n_classes,
                              hidden=args.hidden, lstm_layers=args.lstm_layers,
                              attn_heads=args.attn_heads, proj_dim=args.proj_dim, dropout=args.dropout,
@@ -891,7 +1054,7 @@ def main():
         log.error("No model to save."); return
 
     model_key = f"model_{n_classes}.pt"
-    artifact = dict(type="attention_bilstm_xyz_angles", in_dim=int(in_dim),
+    artifact = dict(type=f"{args.model}_xyz_angles", in_dim=int(in_dim),
                     n_continuous=N_CONTINUOUS, n_classes=n_classes,
                     hidden=args.hidden, lstm_layers=args.lstm_layers,
                     attn_heads=args.attn_heads, proj_dim=args.proj_dim, dropout=args.dropout,
@@ -914,8 +1077,7 @@ def main():
 
     if n_classes == 42:
         _, _, W7, b7 = derive_head_7_from_42(best_global_state)
-        m7 = AttentionBiLSTM(in_dim, 7, hidden=args.hidden, lstm_layers=args.lstm_layers,
-                             attn_heads=args.attn_heads, proj_dim=args.proj_dim, dropout=args.dropout)
+        m7 = build_model(args, in_dim, 7)
         sd7 = m7.state_dict()
         for k, v in sd7.items():
             if "head" in k: continue
