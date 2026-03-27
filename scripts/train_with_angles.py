@@ -812,7 +812,9 @@ class ResNet1DLstm(nn.Module):
 # ================================================================
 # Model: Spatio-Temporal Graph Convolutional Network (ST-GCN)
 # ================================================================
-# Skeleton adjacency: 21 MediaPipe hand joints + 3 arm joints (shoulder=21, elbow=22, arm_wrist=23)
+# Skeleton: 21 MediaPipe hand joints + 2 arm joints (shoulder=21, elbow=22).
+# Arm wrist is merged with hand wrist (node 0) to avoid redundancy.
+# Total: 23 nodes.
 SKELETON_EDGES = [
     # Thumb
     (0, 1), (1, 2), (2, 3), (3, 4),
@@ -824,40 +826,75 @@ SKELETON_EDGES = [
     (0, 13), (13, 14), (14, 15), (15, 16),
     # Pinky
     (0, 17), (17, 18), (18, 19), (19, 20),
-    # Arm
-    (21, 22), (22, 23),
-    # Arm-to-hand wrist
-    (23, 0),
+    # Arm: shoulder(21) → elbow(22) → wrist(0)
+    (21, 22), (22, 0),
 ]
-NUM_JOINTS = 24
+NUM_JOINTS = 23  # 21 hand + 2 arm (wrist merged)
+
+# Distance from wrist (node 0) for spatial partitioning.
+# Used to partition neighbors into centripetal (closer to wrist) vs centrifugal (farther).
+_JOINT_DEPTH = {0: 0,
+    1: 1, 2: 2, 3: 3, 4: 4,           # thumb
+    5: 1, 6: 2, 7: 3, 8: 4,           # index
+    9: 1, 10: 2, 11: 3, 12: 4,        # middle
+    13: 1, 14: 2, 15: 3, 16: 4,       # ring
+    17: 1, 18: 2, 19: 3, 20: 4,       # pinky
+    21: 2, 22: 1,                       # arm: elbow closer to wrist than shoulder
+}
 
 
-def _build_adjacency():
-    """Build normalized adjacency matrix with self-loops for the hand+arm skeleton."""
-    A = np.eye(NUM_JOINTS, dtype=np.float32)
+def _build_adjacency_partitions():
+    """Build 3-partition adjacency matrices for ST-GCN (Yan et al. 2018).
+
+    Partitions:
+      A_self:        identity (self-loops)
+      A_centripetal: neighbor is closer to wrist (root)
+      A_centrifugal: neighbor is farther from wrist
+
+    Each is D^{-1/2} A_k D^{-1/2} normalized independently.
+    """
+    A_self = np.eye(NUM_JOINTS, dtype=np.float32)
+    A_cen  = np.zeros((NUM_JOINTS, NUM_JOINTS), dtype=np.float32)
+    A_cfu  = np.zeros((NUM_JOINTS, NUM_JOINTS), dtype=np.float32)
+
     for i, j in SKELETON_EDGES:
-        A[i, j] = 1.0
-        A[j, i] = 1.0
-    # Normalize: D^{-1/2} A D^{-1/2}
-    D = A.sum(axis=1)
-    D_inv_sqrt = np.diag(1.0 / np.sqrt(D))
-    A_norm = D_inv_sqrt @ A @ D_inv_sqrt
-    return A_norm
+        # i→j edge: which direction is centripetal?
+        if _JOINT_DEPTH[j] < _JOINT_DEPTH[i]:
+            # j is closer to wrist → centripetal for i
+            A_cen[i, j] = 1.0
+            A_cfu[j, i] = 1.0
+        else:
+            A_cfu[i, j] = 1.0
+            A_cen[j, i] = 1.0
+
+    partitions = []
+    for A in [A_self, A_cen, A_cfu]:
+        D = A.sum(axis=1).clip(1e-6)
+        D_inv_sqrt = np.diag(1.0 / np.sqrt(D))
+        partitions.append(D_inv_sqrt @ A @ D_inv_sqrt)
+    return np.stack(partitions, axis=0)  # (3, V, V)
 
 
 class _STGCNBlock(nn.Module):
-    """One ST-GCN block: graph conv → temporal conv, with residual."""
-    def __init__(self, in_ch, out_ch, A, temporal_stride=1):
+    """One ST-GCN block with 3-partition graph conv → temporal conv + residual."""
+    def __init__(self, in_ch, out_ch, num_partitions=3, temporal_stride=1):
         super().__init__()
-        self.A = A  # will be registered as buffer by parent
-        # Graph convolution: per-node feature transform, then aggregate by A
-        self.gcn_w = nn.Conv2d(in_ch, out_ch, kernel_size=1)
+        self.num_partitions = num_partitions
+        # One Conv2d per partition (1×1 to transform node features)
+        self.gcn_convs = nn.ModuleList([
+            nn.Conv2d(in_ch, out_ch, kernel_size=1) for _ in range(num_partitions)
+        ])
         self.gcn_bn = nn.BatchNorm2d(out_ch)
-        # Learnable edge importance weighting
-        self.edge_importance = nn.Parameter(torch.ones_like(A))
-        # Temporal convolution: conv over time axis per joint
+        # Learnable edge importance per partition
+        # Initialized to ones so initial behavior ≈ uniform weighting
+        self.edge_importance = nn.ParameterList([
+            nn.Parameter(torch.ones(NUM_JOINTS, NUM_JOINTS))
+            for _ in range(num_partitions)
+        ])
+        # Temporal convolution
         self.tcn = nn.Sequential(
-            nn.Conv2d(out_ch, out_ch, kernel_size=(9, 1), padding=(4, 0), stride=(temporal_stride, 1)),
+            nn.Conv2d(out_ch, out_ch, kernel_size=(9, 1), padding=(4, 0),
+                      stride=(temporal_stride, 1)),
             nn.BatchNorm2d(out_ch),
         )
         self.act = nn.GELU()
@@ -870,70 +907,139 @@ class _STGCNBlock(nn.Module):
         else:
             self.residual = nn.Identity()
 
-    def forward(self, x):
-        # x: (B, C, T, V)
+    def forward(self, x, A_partitions):
+        # x: (B, C, T, V), A_partitions: (3, V, V)
         res = self.residual(x)
-        # Graph conv: x @ (A * importance)
-        A_w = self.A * self.edge_importance
-        x = self.gcn_w(x)                          # (B, out_ch, T, V)
-        x = torch.einsum('bctv,vw->bctw', x, A_w)  # aggregate neighbors
-        x = self.act(self.gcn_bn(x))
-        # Temporal conv
-        x = self.act(self.tcn(x) + res)
-        return x
+        # Multi-partition graph conv: sum contributions from each partition
+        out = 0
+        for k in range(self.num_partitions):
+            A_k = A_partitions[k] * self.edge_importance[k]
+            h = self.gcn_convs[k](x)                        # (B, out_ch, T, V)
+            out = out + torch.einsum('bctv,vw->bctw', h, A_k)
+        out = self.act(self.gcn_bn(out))
+        # Temporal conv + residual
+        out = self.act(self.tcn(out) + res)
+        return out
 
 
 class SpatioTemporalGCN(nn.Module):
     def __init__(self, in_dim, n_classes, dropout=0.4):
         super().__init__()
-        A_np = _build_adjacency()
-        A = torch.from_numpy(A_np)
-        self.register_buffer('A', A)
+        A_parts = _build_adjacency_partitions()
+        self.register_buffer('A_partitions', torch.from_numpy(A_parts))  # (3, V, V)
 
-        # ST-GCN blocks: 6 → 64 → 128 → 256
+        # Input channels per joint: xyz_pos(3) + xyz_vel(3) + joint_valid(1) = 7
+        n_in_ch = 7
+
+        # ST-GCN blocks: 7 → 64 → 128 → 256
+        self.temporal_strides = [1, 2, 2]
         self.blocks = nn.ModuleList([
-            _STGCNBlock(6, 64, A, temporal_stride=1),
-            _STGCNBlock(64, 128, A, temporal_stride=2),
-            _STGCNBlock(128, 256, A, temporal_stride=2),
+            _STGCNBlock(n_in_ch, 64, temporal_stride=1),
+            _STGCNBlock(64, 128, temporal_stride=2),
+            _STGCNBlock(128, 256, temporal_stride=2),
         ])
-        # Assign the shared adjacency buffer to each block
-        for block in self.blocks:
-            block.A = A
 
-        # Number of non-joint features (everything after first 144)
-        self.n_rest = in_dim - 144
+        # Learnable per-joint importance for pooling (not uniform)
+        self.joint_importance = nn.Parameter(torch.ones(NUM_JOINTS))
 
-        head_dim = 256 + self.n_rest if self.n_rest > 0 else 256
+        # Non-joint features: vel_wrist(3) + scale(1) + angles(16) +
+        #   frame_valid(1) + hand_cov(1) + arm_cov(1) = 23 kept channels
+        # (drop per-joint validity and angle validity since graph uses them directly)
+        self._rest_idx = (
+            list(range(144, 165))  # vel_wrist(3), scale(1), angles(16), frame_valid(1)
+            + [189, 190]           # hand_cov, arm_cov
+        )
+        n_rest = len(self._rest_idx)
+
+        head_dim = 256 + n_rest
         self.head = nn.Sequential(
             nn.LayerNorm(head_dim), nn.Dropout(dropout), nn.Linear(head_dim, n_classes),
         )
 
+    def _downsample_mask(self, mask):
+        """Downsample temporal mask to match stride-2 reductions in ST-GCN blocks.
+
+        A downsampled frame is valid if ANY of the original frames it covers were valid.
+        """
+        m = mask
+        for stride in self.temporal_strides:
+            if stride > 1:
+                T = m.size(1)
+                # Pad to even length if needed
+                if T % 2 == 1:
+                    m = nn.functional.pad(m, (0, 1), value=0.0)
+                # Max-pool: valid if any constituent frame was valid
+                m = m.reshape(m.size(0), -1, 2).max(dim=2).values
+        return m
+
     def forward(self, x, mask):
-        # x: (B, T, 207), mask: (B, T)
+        # x: (B, T, F), mask: (B, T)
         B, T, _ = x.shape
-        # Extract joint features: pose(72) + vel(72) → (B, T, 24, 3) each
-        pose = x[:, :, :72].reshape(B, T, 24, 3)
-        vel = x[:, :, 72:144].reshape(B, T, 24, 3)
-        # Stack as (B, 6, T, 24) — 6 channels per joint
-        graph_in = torch.cat([pose, vel], dim=-1)     # (B, T, 24, 6)
-        graph_in = graph_in.permute(0, 3, 1, 2)       # (B, 6, T, 24)
-        # Zero out invalid frames
+
+        # Extract joint features: pose(72) + vel(72) → (B, T, 23, 3) each
+        # Hand joints: 21 joints from pose[0:63] and vel[72:135]
+        # Arm joints: shoulder and elbow from pose[63:69] and vel[135:141]
+        # (arm wrist pose[69:72] / vel[141:144] merged with hand wrist node 0)
+        hand_pose = x[:, :, :63].reshape(B, T, 21, 3)                # (B, T, 21, 3)
+        arm_se_pose = x[:, :, 63:69].reshape(B, T, 2, 3)             # shoulder, elbow
+        hand_vel = x[:, :, 72:135].reshape(B, T, 21, 3)
+        arm_se_vel = x[:, :, 135:141].reshape(B, T, 2, 3)
+
+        # Merge arm wrist into hand wrist (node 0) by averaging
+        arm_wrist_pose = x[:, :, 69:72].unsqueeze(2)                  # (B, T, 1, 3)
+        arm_wrist_vel = x[:, :, 141:144].unsqueeze(2)
+        hand_pose_merged = hand_pose.clone()
+        hand_vel_merged = hand_vel.clone()
+        hand_pose_merged[:, :, 0:1, :] = (hand_pose[:, :, 0:1, :] + arm_wrist_pose) / 2
+        hand_vel_merged[:, :, 0:1, :] = (hand_vel[:, :, 0:1, :] + arm_wrist_vel) / 2
+
+        pose_all = torch.cat([hand_pose_merged, arm_se_pose], dim=2)  # (B, T, 23, 3)
+        vel_all = torch.cat([hand_vel_merged, arm_se_vel], dim=2)     # (B, T, 23, 3)
+
+        # Per-joint validity as a node feature: hand(21) + arm(2 for shoulder,elbow)
+        hand_jv = x[:, :, 165:186].unsqueeze(-1)                     # (B, T, 21, 1)
+        arm_jv = x[:, :, 186:189]                                    # (B, T, 3)
+        arm_se_jv = arm_jv[:, :, :2].unsqueeze(-1)                   # (B, T, 2, 1) shoulder,elbow
+        # Wrist validity: valid if either hand or arm wrist is valid
+        wrist_jv = torch.max(hand_jv[:, :, 0:1, :], arm_jv[:, :, 2:3].unsqueeze(-1))
+        hand_jv_merged = hand_jv.clone()
+        hand_jv_merged[:, :, 0:1, :] = wrist_jv
+        jv_all = torch.cat([hand_jv_merged, arm_se_jv], dim=2)       # (B, T, 23, 1)
+
+        # Gate joint features by per-joint validity
+        pose_all = pose_all * jv_all
+        vel_all = vel_all * jv_all
+
+        # Build graph input: (B, T, 23, 7) → (B, 7, T, 23)
+        graph_in = torch.cat([pose_all, vel_all, jv_all], dim=-1)     # (B, T, 23, 7)
+        graph_in = graph_in.permute(0, 3, 1, 2)                       # (B, 7, T, 23)
+
+        # Also mask by frame-level validity
         graph_in = graph_in * mask.unsqueeze(1).unsqueeze(-1)
 
         # ST-GCN blocks
         h = graph_in
         for block in self.blocks:
-            h = block(h)                               # (B, 256, T', 24)
+            h = block(h, self.A_partitions)                            # (B, 256, T', 23)
 
-        # Global average pool over time and joints
-        pooled = h.mean(dim=(2, 3))                    # (B, 256)
+        # Mask-aware weighted pooling over time and joints
+        ds_mask = self._downsample_mask(mask)                          # (B, T')
+        T_prime = h.size(2)
+        ds_mask = ds_mask[:, :T_prime]                                 # align lengths
 
-        # Concat non-joint features (masked mean over time)
-        if self.n_rest > 0:
-            rest = x[:, :, 144:]                       # (B, T, 63)
-            mask_f = mask.unsqueeze(-1)                # (B, T, 1)
-            rest_pooled = (rest * mask_f).sum(dim=1) / mask_f.sum(dim=1).clamp(min=1)
-            pooled = torch.cat([pooled, rest_pooled], dim=-1)
+        # Weighted joint pooling (learnable importance, softmax-normalized)
+        joint_w = torch.softmax(self.joint_importance, dim=0)          # (V,)
+        h = (h * joint_w.unsqueeze(0).unsqueeze(0).unsqueeze(0)).sum(dim=3)  # (B, 256, T')
+
+        # Masked temporal pooling
+        mask_t = ds_mask.unsqueeze(1)                                  # (B, 1, T')
+        pooled = (h * mask_t).sum(dim=2) / mask_t.sum(dim=2).clamp(min=1)   # (B, 256)
+
+        # Concat non-joint features (masked mean over original time)
+        rest = x[:, :, self._rest_idx]                                 # (B, T, 23)
+        mask_f = mask.unsqueeze(-1)
+        rest_pooled = (rest * mask_f).sum(dim=1) / mask_f.sum(dim=1).clamp(min=1)
+        pooled = torch.cat([pooled, rest_pooled], dim=-1)
 
         return self.head(pooled)
 
