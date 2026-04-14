@@ -96,6 +96,9 @@ First 164 channels are continuous (`N_CONTINUOUS=164`), remaining 43 are binary.
 | `--condition_vec`        | off     | Append 6-dim one-hot condition vector (from `y42 // 7`) to features. Changes in_dim from 207 to 213. |
 | `--compress_joints`      | off     | Compress first 144 joint features via CNN before temporal model. Drops per-joint validity flags. |
 | `--compress_joints_dim`  | `32`    | Output dimension of joint compression CNN        |
+| `--downsample_features`  | off     | Downsample per-timestamp feature vector before temporal model |
+| `--downsample_method`    | `group_linear` | Strategy: `linear` (global), `group_linear` (per-group), `group_attention` (attention-weighted per-group) |
+| `--downsample_dim`       | `64`    | Target feature dimension after downsampling      |
 | `--clip_norm`            | on      | Per-sample instance normalization of continuous channels |
 | `--normalize_scale_channel` | on   | Normalize bone-length scale by training-fold mean |
 
@@ -170,4 +173,23 @@ python scripts/train_with_angles.py --roots dataset/*_done \
 # 42-class training (gesture x condition)
 python scripts/train_with_angles.py --roots dataset/*_done \
     --n_classes 42 --model bilstm
+
+# Feature downsampling: group-aware projection (207 → 64 dims)
+python scripts/train_with_angles.py --roots dataset/*_done \
+    --downsample_features --downsample_dim 64 --downsample_method group_linear
+
+# Feature downsampling: attention-weighted (learn which features matter)
+python scripts/train_with_angles.py --roots dataset/*_done \
+    --downsample_features --downsample_dim 64 --downsample_method group_attention
+
+# Feature downsampling: simple global linear projection
+python scripts/train_with_angles.py --roots dataset/*_done \
+    --downsample_features --downsample_dim 32 --downsample_method linear
+
+# Sweep downsample dims to find sweet spot
+for dim in 16 32 64 128; do
+    python scripts/train_with_angles.py --roots dataset/*_done \
+        --downsample_features --downsample_dim $dim \
+        --save_path runs/ds_group_linear_$dim --epochs 30 --patience 10
+done
 ```

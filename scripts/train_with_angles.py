@@ -63,6 +63,19 @@ ARM_TRIPLETS = [(0, 1, 2)]
 
 EPS = 1e-6
 
+# Semantic feature groups for downsampling: (name, start_idx, end_idx).
+# Convolution across the feature dimension is inappropriate because groups are
+# semantically unrelated (e.g. pinky_z is not "adjacent" to shoulder_x).
+# Instead, each group is projected independently.
+_FEATURE_GROUPS = [
+    ("pose",      0,    72),   # hand (21j×3) + arm (3j×3) XYZ
+    ("vel_pose",  72,  144),   # frame-to-frame velocity of pose
+    ("vel_wrist", 144, 147),   # absolute wrist velocity
+    ("scale",     147, 148),   # bone-length scale
+    ("angles",    148, 164),   # 15 hand bend + 1 elbow angle
+    ("validity",  164, 207),   # all binary validity flags
+]
+
 
 # ================================================================
 # Angle computation
@@ -204,6 +217,17 @@ def parse_args():
                     help="Compress first 144 joint features via CNN before temporal model")
     ap.add_argument("--compress_joints_dim", type=int, default=32,
                     help="Output dim of joint compression CNN (default 32)")
+
+    ap.add_argument("--downsample_features", action="store_true", default=False,
+                    help="Downsample per-timestamp feature vector before temporal model")
+    ap.add_argument("--downsample_method", type=str, default="group_linear",
+                    choices=["linear", "group_linear", "group_attention"],
+                    help="Downsampling strategy: linear (global projection), "
+                         "group_linear (per-semantic-group projections), "
+                         "group_attention (attention-weighted per-group projections)")
+    ap.add_argument("--downsample_dim", type=int, default=64,
+                    help="Target feature dimension after downsampling (default 64)")
+
     ap.add_argument("--condition_vec", action="store_true", default=False,
                     help="Append 6-dim one-hot condition vector (y42 // 7) to features")
 
@@ -1099,11 +1123,144 @@ class JointCompressWrapper(nn.Module):
 
 
 # ================================================================
+# Feature downsampling — reduce per-timestamp feature dimension
+# ================================================================
+# Convolution across the 207-dim feature axis is inappropriate because
+# semantically unrelated features (e.g. pinky_z, shoulder_x) sit side by
+# side. Instead, these modules project features *within* each semantic
+# group independently, preserving group boundaries.
+
+def _allocate_group_dims(group_sizes, target_total):
+    """Proportionally allocate output dims to groups, ensuring each >= 1."""
+    total_in = sum(group_sizes)
+    allocs = [max(1, round(target_total * s / total_in)) for s in group_sizes]
+    diff = target_total - sum(allocs)
+    order = sorted(range(len(allocs)), key=lambda i: -group_sizes[i])
+    for i in order:
+        if diff == 0:
+            break
+        if diff > 0:
+            allocs[i] += 1
+            diff -= 1
+        elif allocs[i] > 1:
+            allocs[i] -= 1
+            diff += 1
+    return allocs
+
+
+class LinearDownsampler(nn.Module):
+    """Global linear projection of the full feature vector.
+
+    Simplest baseline: one Linear layer reduces all 207 dims to target_dim.
+    No group structure is enforced — the model must learn feature relationships.
+    """
+    def __init__(self, in_dim, target_dim):
+        super().__init__()
+        self.proj = nn.Sequential(
+            nn.Linear(in_dim, target_dim),
+            nn.LayerNorm(target_dim),
+            nn.GELU(),
+        )
+        self.out_dim = target_dim
+
+    def forward(self, x):
+        return self.proj(x)
+
+
+class GroupLinearDownsampler(nn.Module):
+    """Per-group linear projections with proportional dim allocation.
+
+    Each semantic group (pose, velocity, angles, validity, etc.) is projected
+    independently to a smaller dimension. Output dims are allocated
+    proportionally to input group sizes.
+    """
+    def __init__(self, in_dim, target_dim):
+        super().__init__()
+        self._extra_dim = max(0, in_dim - 207)
+        sizes = [e - s for _, s, e in _FEATURE_GROUPS]
+        allocs = _allocate_group_dims(sizes, target_dim)
+        self.projections = nn.ModuleList()
+        for (_, s, e), out_d in zip(_FEATURE_GROUPS, allocs):
+            self.projections.append(nn.Sequential(
+                nn.Linear(e - s, out_d),
+                nn.LayerNorm(out_d),
+                nn.GELU(),
+            ))
+        self.group_allocs = allocs
+        self.out_dim = sum(allocs) + self._extra_dim
+
+    def forward(self, x):
+        parts = []
+        for (_, s, e), proj in zip(_FEATURE_GROUPS, self.projections):
+            parts.append(proj(x[:, :, s:e]))
+        if self._extra_dim > 0:
+            parts.append(x[:, :, 207:])
+        return torch.cat(parts, dim=-1)
+
+
+class GroupAttentionDownsampler(nn.Module):
+    """Attention-weighted per-group projections.
+
+    Like GroupLinearDownsampler, but first learns per-feature importance
+    weights within each group via softmax. This lets the model explicitly
+    down-weight less informative features before projecting.
+    """
+    def __init__(self, in_dim, target_dim):
+        super().__init__()
+        self._extra_dim = max(0, in_dim - 207)
+        sizes = [e - s for _, s, e in _FEATURE_GROUPS]
+        allocs = _allocate_group_dims(sizes, target_dim)
+        self.attn_logits = nn.ParameterList()
+        self.projections = nn.ModuleList()
+        for (_, s, e), out_d in zip(_FEATURE_GROUPS, allocs):
+            in_d = e - s
+            self.attn_logits.append(nn.Parameter(torch.zeros(in_d)))
+            self.projections.append(nn.Sequential(
+                nn.Linear(in_d, out_d),
+                nn.LayerNorm(out_d),
+                nn.GELU(),
+            ))
+        self.group_allocs = allocs
+        self.out_dim = sum(allocs) + self._extra_dim
+
+    def forward(self, x):
+        parts = []
+        for i, (_, s, e) in enumerate(_FEATURE_GROUPS):
+            chunk = x[:, :, s:e]
+            attn = torch.softmax(self.attn_logits[i], dim=0)
+            parts.append(self.projections[i](chunk * attn))
+        if self._extra_dim > 0:
+            parts.append(x[:, :, 207:])
+        return torch.cat(parts, dim=-1)
+
+
+class FeatureDownsampleWrapper(nn.Module):
+    """Wraps any temporal model with a feature downsampler."""
+    def __init__(self, downsampler, temporal_model):
+        super().__init__()
+        self.downsampler = downsampler
+        self.temporal_model = temporal_model
+
+    def forward(self, x, mask):
+        return self.temporal_model(self.downsampler(x), mask)
+
+
+# ================================================================
 # Model factory
 # ================================================================
 def build_model(args, in_dim, n_classes):
     model_in_dim = in_dim
-    if args.compress_joints:
+    downsampler = None
+
+    if args.downsample_features:
+        if args.downsample_method == "linear":
+            downsampler = LinearDownsampler(in_dim, args.downsample_dim)
+        elif args.downsample_method == "group_linear":
+            downsampler = GroupLinearDownsampler(in_dim, args.downsample_dim)
+        elif args.downsample_method == "group_attention":
+            downsampler = GroupAttentionDownsampler(in_dim, args.downsample_dim)
+        model_in_dim = downsampler.out_dim
+    elif args.compress_joints:
         # compress_joints_dim + 23 kept channels (vel_wrist, scale, angles, frame_valid, hand_cov, arm_cov)
         model_in_dim = args.compress_joints_dim + len(JointCompressWrapper._KEEP_IDX)
 
@@ -1124,11 +1281,13 @@ def build_model(args, in_dim, n_classes):
                                 hidden=args.hidden, lstm_layers=args.lstm_layers,
                                 attn_heads=args.attn_heads, dropout=args.dropout)
     elif args.model == "stgcn":
-        # ST-GCN handles its own feature extraction; bypass compress_joints
+        # ST-GCN handles its own feature extraction; bypass downsample/compress
         return SpatioTemporalGCN(in_dim, n_classes, dropout=args.dropout)
     else:
         raise ValueError(f"Unknown model: {args.model}")
 
+    if downsampler is not None:
+        return FeatureDownsampleWrapper(downsampler, temporal)
     if args.compress_joints:
         return JointCompressWrapper(JointCompressor(args.compress_joints_dim), temporal)
     return temporal
