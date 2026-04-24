@@ -1,6 +1,9 @@
-numpy
-opencv-python
-mediapipe
-torch
+# Runtime stack verified with the ROS 2 gesture recognizer in WSL/Ubuntu.
+# Keep NumPy < 2 because current MediaPipe + matplotlib usage in this repo
+# relies on binaries built against the NumPy 1.x ABI.
+numpy<2
+opencv-contrib-python<4.11
+mediapipe==0.10.14
+torch==2.11.0
 scikit-learn
 matplotlib
