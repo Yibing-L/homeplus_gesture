@@ -21,7 +21,7 @@ Recommended layout:
 
 Download `dataset.zip` from the GitHub Release:
 
-https://github.com/Yibing-L/homeplus_gesture/releases/tag/data-v1
+https://github.com/Yibing-L/homeplus_gesture/releases/tag/data-v3
 
 ## Setup
 
