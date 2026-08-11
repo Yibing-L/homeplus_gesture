@@ -6,6 +6,7 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+tmp/
 .pytest_cache/
 .mypy_cache/
 
@@ -25,6 +26,7 @@ Thumbs.db
 data/
 dataset.zip
 *.npz
+!calibrations/*.npz
 output/
 processed*/
 *_done/
@@ -36,6 +38,9 @@ checkpoints/
 *.pt
 *.pth
 *.onnx
+
+# Downloaded MediaPipe task bundles
+models/mediapipe/*.task
 
 # Logs
 *.log

@@ -1,2 +1,2 @@
 -r requirements.txt
-pyrealsense2
+pyrealsense2==2.58.3.10794
